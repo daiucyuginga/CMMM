@@ -50,16 +50,10 @@ def run_tests():
     assert "解像度" in reason
     print("形式不一致が正しく判定されました！")
 
-    print("\n=== [5/5] In/Out 微調整 (コマ送り/秒送り) & 分割・削除テスト ===")
+    print("\n=== [5/5] クリップ分割 (Split) & 削除 (Delete) テスト ===")
     item0 = window.storyboard.item(0)
     window.storyboard.setCurrentItem(item0)
     window.on_clip_selected(item0)
-
-    # In 点微調整テスト (+1秒)
-    old_in = item0.start_sec
-    window.adjust_in_time(1.0)
-    print(f"In点調整: {old_in}s -> {item0.start_sec}s")
-    assert abs(item0.start_sec - (old_in + 1.0)) < 0.001
 
     # 再生位置 4.0 秒として分割テスト
     window.split_current_clip(at_sec=4.0)

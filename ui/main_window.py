@@ -1,8 +1,7 @@
 """
 ui/main_window.py
-CMMM メインウィンドウ - PySide6 完全ネイティブ UI
-テレビCMカット・場面抜き出し編集に特化した
-「①ザックリ分割 → ②クリップごとの拡大＆コマ送りIn/Out微調整」ワークフロー
+CMMM メインウィンドウ
+Windows ムービーメーカーの直感的な切り貼り編集（プレビュー位置で分割 → 不要クリップをDeleteで削除）を忠実に再現
 """
 
 import os
@@ -16,7 +15,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QMessageBox, QProgressDialog,
     QButtonGroup, QGroupBox, QToolBar
 )
-from PySide6.QtCore import Qt, QUrl, Slot, Signal, QTimer
+from PySide6.QtCore import Qt, QUrl, Slot, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -26,7 +25,7 @@ from core.gop_analyzer import VideoAnalyzer, VideoMetadata
 from core.engine import execute_recipe
 from .styles import MODERN_DARK_STYLE
 from .storyboard import StoryboardWidget, StoryboardItem
-from .range_slider import ClipTimelineSlider
+from .range_slider import VideoSlider
 from .async_thumbnail import ThumbnailManager
 
 
@@ -49,9 +48,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CMMM Studio - 無劣化スマート動画エディタ (CMカット・場面抜き出し特化)")
-        self.resize(1260, 840)
-        self.setMinimumSize(980, 640)
+        self.setWindowTitle("CMMM")
+        self.resize(1200, 800)
+        self.setMinimumSize(960, 600)
         self.setStyleSheet(MODERN_DARK_STYLE)
 
         self.runner = FFmpegRunner()
@@ -61,7 +60,6 @@ class MainWindow(QMainWindow):
         self.base_meta: Optional[VideoMetadata] = None
         self.mode = "lossless"  # "lossless" または "smart"
         self.active_clip_item: Optional[StoryboardItem] = None
-        self.preview_end_limit_ms: Optional[int] = None  # 先頭/末尾プレビュー用停止リミット
 
         # メディアプレイヤー初期化
         self.player = QMediaPlayer(self)
@@ -88,18 +86,18 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        lbl_mode = QLabel(" 処理モード: ")
-        lbl_mode.setStyleSheet("color: #aaa; font-weight: bold;")
+        lbl_mode = QLabel(" モード: ")
+        lbl_mode.setStyleSheet("color: #aaa;")
         toolbar.addWidget(lbl_mode)
 
-        self.btn_lossless = QPushButton("⚡ 完全無劣化 (Keyframe)")
+        self.btn_lossless = QPushButton("完全無劣化")
         self.btn_lossless.setCheckable(True)
         self.btn_lossless.setChecked(True)
         self.btn_lossless.setProperty("class", "modeButton")
         self.btn_lossless.clicked.connect(lambda: self.set_mode("lossless"))
         toolbar.addWidget(self.btn_lossless)
 
-        self.btn_smart = QPushButton("🎯 スマートカット (Frame-Accurate)")
+        self.btn_smart = QPushButton("スマートカット")
         self.btn_smart.setCheckable(True)
         self.btn_smart.setProperty("class", "modeButton")
         self.btn_smart.clicked.connect(lambda: self.set_mode("smart"))
@@ -111,13 +109,13 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        btn_recipe = QPushButton("💾 レシピ保存")
+        btn_recipe = QPushButton("レシピ保存")
         btn_recipe.clicked.connect(self.on_save_recipe_clicked)
         toolbar.addWidget(btn_recipe)
 
         toolbar.addSeparator()
 
-        btn_export = QPushButton("🚀 エクスポート")
+        btn_export = QPushButton("エクスポート")
         btn_export.setObjectName("accentButton")
         btn_export.clicked.connect(self.on_export_clicked)
         toolbar.addWidget(btn_export)
@@ -142,12 +140,12 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(6)
 
-        # 画面
+        # 動画画面
         self.video_widget.setStyleSheet("background-color: #000; border-radius: 6px;")
-        self.video_widget.setMinimumHeight(300)
+        self.video_widget.setMinimumHeight(320)
         preview_layout.addWidget(self.video_widget, stretch=1)
 
-        # タイムコード表示行
+        # タイムコード行
         tc_layout = QHBoxLayout()
         self.lbl_current_time = QLabel("00:00:00.000")
         self.lbl_current_time.setProperty("class", "timeCode")
@@ -156,136 +154,46 @@ class MainWindow(QMainWindow):
         self.lbl_total_time = QLabel("00:00:00.000")
         self.lbl_total_time.setProperty("class", "timeCode")
 
-        self.lbl_clip_range = QLabel("選択中クリップ範囲: 未設定")
-        self.lbl_clip_range.setStyleSheet("color: #60cdff; font-weight: 500;")
+        self.lbl_clip_name_banner = QLabel("")
+        self.lbl_clip_name_banner.setStyleSheet("color: #aaa;")
 
         tc_layout.addWidget(self.lbl_current_time)
         tc_layout.addWidget(tc_sep)
         tc_layout.addWidget(self.lbl_total_time)
+        tc_layout.addSpacing(16)
+        tc_layout.addWidget(self.lbl_clip_name_banner)
         tc_layout.addStretch()
-        tc_layout.addWidget(self.lbl_clip_range)
         preview_layout.addLayout(tc_layout)
 
-        # クリップ拡大タイムラインスライダー (ミニマップ付き)
-        self.timeline_slider = ClipTimelineSlider(self)
-        self.timeline_slider.positionChanged.connect(self.on_slider_position_changed)
-        self.timeline_slider.wheelStep.connect(self.on_wheel_step)
-        preview_layout.addWidget(self.timeline_slider)
+        # WMM風の再生シークバー
+        self.video_slider = VideoSlider(self)
+        self.video_slider.positionChanged.connect(self.on_slider_position_changed)
+        self.video_slider.wheelStep.connect(self.on_wheel_step)
+        preview_layout.addWidget(self.video_slider)
 
         # ========================================================
-        # 【微調整コントローラー】先頭(In点)と末尾(Out点)のコマ送り伸縮
-        # ========================================================
-        fine_tune_box = QGroupBox("クリップの In点 / Out点 微調整（CM境界やシーン切れ目にピタッと合わせる）")
-        fine_tune_layout = QHBoxLayout(fine_tune_box)
-        fine_tune_layout.setContentsMargins(8, 8, 8, 8)
-
-        # --- 先頭 (In点) コントロール ---
-        in_ctrl_layout = QHBoxLayout()
-        lbl_in_title = QLabel("◀ 先頭 (In点):")
-        lbl_in_title.setStyleSheet("font-weight: bold; color: #60cdff;")
-
-        btn_in_m1s = QPushButton("-1秒")
-        btn_in_m1s.setToolTip("In点を1秒手前に戻す (削った部分を復活)")
-        btn_in_m1s.clicked.connect(lambda: self.adjust_in_time(-1.0))
-
-        btn_in_m1f = QPushButton("-1コマ")
-        btn_in_m1f.setToolTip("In点を1コマ手前に戻す")
-        btn_in_m1f.clicked.connect(lambda: self.adjust_in_time(-0.033))
-
-        self.lbl_in_value = QLabel("00:00:00.000")
-        self.lbl_in_value.setStyleSheet("font-family: Consolas; font-weight: bold; padding: 2px 6px; background: #1a1a1a; border-radius: 3px;")
-
-        btn_in_p1f = QPushButton("+1コマ")
-        btn_in_p1f.setToolTip("In点を1コマ進める (頭を削る)")
-        btn_in_p1f.clicked.connect(lambda: self.adjust_in_time(0.033))
-
-        btn_in_p1s = QPushButton("+1秒")
-        btn_in_p1s.setToolTip("In点を1秒進める")
-        btn_in_p1s.clicked.connect(lambda: self.adjust_in_time(1.0))
-
-        btn_set_in_current = QPushButton("現在位置に設定 (I)")
-        btn_set_in_current.setStyleSheet("color: #60cdff;")
-        btn_set_in_current.clicked.connect(self.set_current_as_in)
-
-        in_ctrl_layout.addWidget(lbl_in_title)
-        in_ctrl_layout.addWidget(btn_in_m1s)
-        in_ctrl_layout.addWidget(btn_in_m1f)
-        in_ctrl_layout.addWidget(self.lbl_in_value)
-        in_ctrl_layout.addWidget(btn_in_p1f)
-        in_ctrl_layout.addWidget(btn_in_p1s)
-        in_ctrl_layout.addWidget(btn_set_in_current)
-        fine_tune_layout.addLayout(in_ctrl_layout)
-
-        fine_tune_layout.addSpacing(16)
-
-        # --- 末尾 (Out点) コントロール ---
-        out_ctrl_layout = QHBoxLayout()
-        lbl_out_title = QLabel("▶ 末尾 (Out点):")
-        lbl_out_title.setStyleSheet("font-weight: bold; color: #ffaa00;")
-
-        btn_out_m1s = QPushButton("-1秒")
-        btn_out_m1s.setToolTip("Out点を1秒手前に縮める (末尾を削る)")
-        btn_out_m1s.clicked.connect(lambda: self.adjust_out_time(-1.0))
-
-        btn_out_m1f = QPushButton("-1コマ")
-        btn_out_m1f.setToolTip("Out点を1コマ手前に縮める")
-        btn_out_m1f.clicked.connect(lambda: self.adjust_out_time(-0.033))
-
-        self.lbl_out_value = QLabel("00:00:00.000")
-        self.lbl_out_value.setStyleSheet("font-family: Consolas; font-weight: bold; padding: 2px 6px; background: #1a1a1a; border-radius: 3px;")
-
-        btn_out_p1f = QPushButton("+1コマ")
-        btn_out_p1f.setToolTip("Out点を1コマ進める (削った末尾を復活)")
-        btn_out_p1f.clicked.connect(lambda: self.adjust_out_time(0.033))
-
-        btn_out_p1s = QPushButton("+1秒")
-        btn_out_p1s.setToolTip("Out点を1秒進める")
-        btn_out_p1s.clicked.connect(lambda: self.adjust_out_time(1.0))
-
-        btn_set_out_current = QPushButton("現在位置に設定 (O)")
-        btn_set_out_current.setStyleSheet("color: #ffaa00;")
-        btn_set_out_current.clicked.connect(self.set_current_as_out)
-
-        out_ctrl_layout.addWidget(lbl_out_title)
-        out_ctrl_layout.addWidget(btn_out_m1s)
-        out_ctrl_layout.addWidget(btn_out_m1f)
-        out_ctrl_layout.addWidget(self.lbl_out_value)
-        out_ctrl_layout.addWidget(btn_out_p1f)
-        out_ctrl_layout.addWidget(btn_out_p1s)
-        out_ctrl_layout.addWidget(btn_set_out_current)
-        fine_tune_layout.addLayout(out_ctrl_layout)
-
-        preview_layout.addWidget(fine_tune_box)
-
-        # ========================================================
-        # 【ナビゲーション・確認再生コントロール】テレビ仕様スキップ
+        # コントロール行（WMM風：再生、コマ送り、スキップ、そして大きな「分割」ボタン）
         # ========================================================
         ctrl_layout = QHBoxLayout()
 
-        # スキップボタン群
-        btn_skip_m30 = QPushButton("◀ 30s")
-        btn_skip_m30.clicked.connect(lambda: self.skip_seconds(-30))
-        btn_skip_m15 = QPushButton("◀ 15s")
+        btn_skip_m15 = QPushButton("◀ 15秒")
         btn_skip_m15.clicked.connect(lambda: self.skip_seconds(-15))
-        btn_skip_m1 = QPushButton("◀ 1s")
+        btn_skip_m1 = QPushButton("◀ 1秒")
         btn_skip_m1.clicked.connect(lambda: self.skip_seconds(-1))
-        btn_step_m1f = QPushButton("◀ 1F")
+        btn_step_m1f = QPushButton("◀ 1コマ")
         btn_step_m1f.clicked.connect(lambda: self.step_frames(-1))
 
-        self.btn_play = QPushButton("▶ 再生 (Space)")
-        self.btn_play.setStyleSheet("background-color: #0078d4; color: #fff; font-weight: bold; min-width: 80px; padding: 6px;")
+        self.btn_play = QPushButton("▶ 再生")
+        self.btn_play.setStyleSheet("background-color: #0078d4; color: #fff; font-weight: bold; min-width: 70px; padding: 6px 14px;")
         self.btn_play.clicked.connect(self.toggle_play)
 
-        btn_step_p1f = QPushButton("1F ▶")
+        btn_step_p1f = QPushButton("1コマ ▶")
         btn_step_p1f.clicked.connect(lambda: self.step_frames(1))
-        btn_skip_p1 = QPushButton("1s ▶")
+        btn_skip_p1 = QPushButton("1秒 ▶")
         btn_skip_p1.clicked.connect(lambda: self.skip_seconds(1))
-        btn_skip_p15 = QPushButton("15s ▶")
+        btn_skip_p15 = QPushButton("15秒 ▶")
         btn_skip_p15.clicked.connect(lambda: self.skip_seconds(15))
-        btn_skip_p30 = QPushButton("30s ▶")
-        btn_skip_p30.clicked.connect(lambda: self.skip_seconds(30))
 
-        ctrl_layout.addWidget(btn_skip_m30)
         ctrl_layout.addWidget(btn_skip_m15)
         ctrl_layout.addWidget(btn_skip_m1)
         ctrl_layout.addWidget(btn_step_m1f)
@@ -293,54 +201,38 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(btn_step_p1f)
         ctrl_layout.addWidget(btn_skip_p1)
         ctrl_layout.addWidget(btn_skip_p15)
-        ctrl_layout.addWidget(btn_skip_p30)
 
-        ctrl_layout.addSpacing(16)
+        ctrl_layout.addSpacing(24)
 
-        # 確認再生ボタン
-        btn_check_head = QPushButton("👁️ 先頭5秒確認")
-        btn_check_head.setToolTip("In点から5秒再生してCM切れ目をチェック")
-        btn_check_head.clicked.connect(self.preview_clip_head)
-
-        btn_check_tail = QPushButton("👁️ 末尾5秒確認")
-        btn_check_tail.setToolTip("Out点直前の5秒間を再生してCM切れ目をチェック")
-        btn_check_tail.clicked.connect(self.preview_clip_tail)
-
-        ctrl_layout.addWidget(btn_check_head)
-        ctrl_layout.addWidget(btn_check_tail)
-
-        ctrl_layout.addSpacing(16)
-
-        # ざっくり分割
-        btn_split = QPushButton("✂ ここで分割 (S)")
-        btn_split.setObjectName("splitButton")
-        btn_split.setToolTip("現在位置でクリップを2つにざっくり分割")
-        btn_split.clicked.connect(self.split_current_clip)
-        ctrl_layout.addWidget(btn_split)
+        # WMMの主役：「ここで分割」ボタン！
+        self.btn_split = QPushButton("✂ ここで分割 (S)")
+        self.btn_split.setObjectName("splitButton")
+        self.btn_split.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px; background-color: rgba(96, 205, 255, 0.18); border: 2px solid #60cdff; color: #60cdff;")
+        self.btn_split.clicked.connect(self.split_current_clip)
+        ctrl_layout.addWidget(self.btn_split)
 
         ctrl_layout.addStretch()
 
-        btn_reset = QPushButton("↺ 全体に戻す")
-        btn_reset.setToolTip("クリップ範囲を元動画全体にリセット")
-        btn_reset.clicked.connect(self.reset_clip_range)
-        ctrl_layout.addWidget(btn_reset)
+        btn_delete_clip = QPushButton("🗑️ 選択クリップを削除 (Del)")
+        btn_delete_clip.clicked.connect(lambda: self.storyboard.delete_selected())
+        ctrl_layout.addWidget(btn_delete_clip)
 
         preview_layout.addLayout(ctrl_layout)
         h_splitter.addWidget(preview_container)
 
         # --- 右側情報パネル ---
         side_panel = QWidget()
-        side_panel.setMaximumWidth(280)
+        side_panel.setMaximumWidth(260)
         side_layout = QVBoxLayout(side_panel)
         side_layout.setContentsMargins(4, 0, 4, 0)
         side_layout.setSpacing(10)
 
-        gb_base = QGroupBox("プロジェクト基準 (UniteMovie)")
+        gb_base = QGroupBox("プロジェクト")
         gb_base_layout = QVBoxLayout(gb_base)
-        self.lbl_base_file = QLabel("基準動画: 未設定")
+        self.lbl_base_file = QLabel("ファイル: 未設定")
         self.lbl_base_res = QLabel("解像度: -")
         self.lbl_base_codec = QLabel("コーデック: -")
-        self.lbl_base_clips = QLabel("総クリップ数: 0 本")
+        self.lbl_base_clips = QLabel("クリップ数: 0 本")
         self.lbl_base_dur = QLabel("合計時間: 00:00:00")
         gb_base_layout.addWidget(self.lbl_base_file)
         gb_base_layout.addWidget(self.lbl_base_res)
@@ -349,11 +241,11 @@ class MainWindow(QMainWindow):
         gb_base_layout.addWidget(self.lbl_base_dur)
         side_layout.addWidget(gb_base)
 
-        gb_clip = QGroupBox("選択中クリップ情報")
+        gb_clip = QGroupBox("クリップ")
         gb_clip_layout = QVBoxLayout(gb_clip)
-        self.lbl_clip_name = QLabel("ファイル: -")
-        self.lbl_clip_in = QLabel("In 点: -")
-        self.lbl_clip_out = QLabel("Out 点: -")
+        self.lbl_clip_name = QLabel("名前: -")
+        self.lbl_clip_in = QLabel("開始: -")
+        self.lbl_clip_out = QLabel("終了: -")
         self.lbl_clip_len = QLabel("長さ: -")
         gb_clip_layout.addWidget(self.lbl_clip_name)
         gb_clip_layout.addWidget(self.lbl_clip_in)
@@ -361,16 +253,14 @@ class MainWindow(QMainWindow):
         gb_clip_layout.addWidget(self.lbl_clip_len)
         side_layout.addWidget(gb_clip)
 
-        gb_tips = QGroupBox("ショートカット一覧")
+        gb_tips = QGroupBox("ショートカット")
         gb_tips_layout = QVBoxLayout(gb_tips)
         gb_tips_layout.addWidget(QLabel("Space : 再生 / 一時停止"))
-        gb_tips_layout.addWidget(QLabel("S : 現在位置で分割"))
-        gb_tips_layout.addWidget(QLabel("I / O : In点 / Out点設定"))
+        gb_tips_layout.addWidget(QLabel("S : ここで分割"))
+        gb_tips_layout.addWidget(QLabel("Delete : 選択クリップを削除"))
         gb_tips_layout.addWidget(QLabel("← / → : 1コマ戻し / 送り"))
         gb_tips_layout.addWidget(QLabel("Ctrl + ←/→ : 1秒送り / 戻し"))
-        gb_tips_layout.addWidget(QLabel("Shift + ←/→ : 5秒送り / 戻し"))
-        gb_tips_layout.addWidget(QLabel("↑ / ↓ : 15秒 / 30秒スキップ"))
-        gb_tips_layout.addWidget(QLabel("Delete : クリップ削除"))
+        gb_tips_layout.addWidget(QLabel("↑ / ↓ : 15秒スキップ"))
         side_layout.addWidget(gb_tips)
 
         side_layout.addStretch()
@@ -384,9 +274,12 @@ class MainWindow(QMainWindow):
         sb_layout.setSpacing(4)
 
         sb_header = QHBoxLayout()
-        sb_title = QLabel("🎞️ ストーリーボード（クリップを選んで上で微調整 / マウスで並び替え / Delete で削除）")
+        sb_title = QLabel("ストーリーボード")
         sb_title.setStyleSheet("font-weight: bold; color: #ddd;")
+        sb_hint = QLabel("（不要なクリップは選択して Delete キーで削除 / ドラッグで並び替え）")
+        sb_hint.setStyleSheet("color: #888; font-size: 11px;")
         sb_header.addWidget(sb_title)
+        sb_header.addWidget(sb_hint)
         sb_header.addStretch()
         sb_layout.addLayout(sb_header)
 
@@ -401,24 +294,21 @@ class MainWindow(QMainWindow):
         v_splitter.setStretchFactor(0, 3)
         v_splitter.setStretchFactor(1, 1)
 
-        self.statusBar().showMessage("準備完了 - 動画ファイルをドラッグ＆ドロップしてください")
+        self.statusBar().showMessage("準備完了")
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle_play)
         QShortcut(QKeySequence(Qt.Key.Key_S), self, self.split_current_clip)
-        QShortcut(QKeySequence(Qt.Key.Key_I), self, self.set_current_as_in)
-        QShortcut(QKeySequence(Qt.Key.Key_O), self, self.set_current_as_out)
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, self.split_current_clip)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.split_current_clip)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.step_frames(-1))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.step_frames(1))
         QShortcut(QKeySequence("Ctrl+Left"), self, lambda: self.skip_seconds(-1))
         QShortcut(QKeySequence("Ctrl+Right"), self, lambda: self.skip_seconds(1))
-        QShortcut(QKeySequence("Shift+Left"), self, lambda: self.skip_seconds(-5))
-        QShortcut(QKeySequence("Shift+Right"), self, lambda: self.skip_seconds(5))
         QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self.skip_seconds(15))
         QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self.skip_seconds(-15))
-        QShortcut(QKeySequence(Qt.Key.Key_PageUp), self, lambda: self.skip_seconds(30))
-        QShortcut(QKeySequence(Qt.Key.Key_PageDown), self, lambda: self.skip_seconds(-30))
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.storyboard.delete_selected)
+        QShortcut(QKeySequence(Qt.Key.Key_Backspace), self, self.storyboard.delete_selected)
 
     def _setup_player_events(self):
         self.player.positionChanged.connect(self.on_player_position_changed)
@@ -427,10 +317,10 @@ class MainWindow(QMainWindow):
 
     def set_mode(self, mode: str):
         self.mode = mode
-        msg = "⚡ 完全無劣化モード (再エンコードなし・超高速)" if mode == "lossless" else "🎯 スマートカットモード (1フレーム精度・境界のみ再エンコード)"
+        msg = "完全無劣化モード" if mode == "lossless" else "スマートカットモード"
         self.statusBar().showMessage(msg, 3000)
 
-    # --- 高速動画追加 & 互換性チェック ---
+    # --- 動画追加 ---
     def add_videos(self, file_paths: List[str]):
         for path in file_paths:
             try:
@@ -444,8 +334,8 @@ class MainWindow(QMainWindow):
                     if not is_compat:
                         QMessageBox.warning(
                             self,
-                            "フォーマット不一致 (除外)",
-                            f"【{meta.file_name}】は基準動画と形式が異なるため追加できませんでした。\n\n理由: {reason}"
+                            "形式不一致",
+                            f"{meta.file_name} は基準動画と形式が異なるため追加できません。\n\n理由: {reason}"
                         )
                         continue
 
@@ -470,10 +360,10 @@ class MainWindow(QMainWindow):
                     self.storyboard.setCurrentItem(item)
                     self.on_clip_selected(item)
 
-                self.statusBar().showMessage(f"追加しました: {meta.file_name}", 2500)
+                self.statusBar().showMessage(f"追加: {meta.file_name}", 2500)
 
             except Exception as e:
-                QMessageBox.critical(self, "エラー", f"動画の読み込みに失敗しました: {path}\n{e}")
+                QMessageBox.critical(self, "エラー", f"動画の読み込みに失敗しました:\n{e}")
 
         self.update_stats()
 
@@ -485,7 +375,7 @@ class MainWindow(QMainWindow):
                 item.setIcon(QIcon(scaled))
                 break
 
-    # --- クリップ選択 & タイムライン切り替え ---
+    # --- クリップ選択 ---
     def on_clip_selected(self, item: StoryboardItem):
         self.active_clip_item = item
         file_path = item.file_path
@@ -494,12 +384,10 @@ class MainWindow(QMainWindow):
         if os.path.abspath(current_source) != os.path.abspath(file_path):
             self.player.setSource(QUrl.fromLocalFile(file_path))
 
-        # クリップ拡大タイムラインスライダーを設定
-        total_ms = int(item.total_sec * 1000)
-        in_ms = int(item.start_sec * 1000)
-        out_ms = int(item.end_sec * 1000)
-        self.timeline_slider.set_clip_info(total_ms, in_ms, out_ms, in_ms)
-        self.player.setPosition(in_ms)
+        # シークバーのスケールは「そのクリップの長さ」
+        dur_ms = int((item.end_sec - item.start_sec) * 1000)
+        self.video_slider.set_duration(dur_ms)
+        self.player.setPosition(int(item.start_sec * 1000))
 
         self._update_clip_info()
 
@@ -517,232 +405,138 @@ class MainWindow(QMainWindow):
                 self.on_clip_selected(cur)
         self.update_stats()
 
-    # --- プレイヤー再生 & スキップ制御 ---
+    # --- プレイヤー再生制御 ---
     def toggle_play(self):
-        self.preview_end_limit_ms = None
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.btn_play.setText("▶ 再生 (Space)")
+            self.btn_play.setText("▶ 再生")
         else:
             self.player.play()
             self.btn_play.setText("⏸ 一時停止")
 
     def skip_seconds(self, sec: float):
-        """指定秒数前後にスキップ (15秒/30秒/1秒など)"""
-        new_pos = max(0, self.player.position() + int(sec * 1000))
-        self.player.setPosition(new_pos)
+        if not self.active_clip_item:
+            return
+        cur_abs_ms = self.player.position()
+        target_abs_ms = cur_abs_ms + int(sec * 1000)
+        min_abs_ms = int(self.active_clip_item.start_sec * 1000)
+        max_abs_ms = int(self.active_clip_item.end_sec * 1000)
+        new_abs_ms = max(min_abs_ms, min(max_abs_ms, target_abs_ms))
+        self.player.setPosition(new_abs_ms)
 
     def step_frames(self, frames: int):
-        """1コマ送り / 戻し (約33ms)"""
-        new_pos = max(0, self.player.position() + frames * 33)
-        self.player.setPosition(new_pos)
+        self.skip_seconds(frames * 0.033)
 
     def on_wheel_step(self, step: int):
         self.step_frames(step)
 
-    def on_player_position_changed(self, pos_ms: int):
-        self.timeline_slider.set_position(pos_ms)
-        sec = pos_ms / 1000.0
-        self.lbl_current_time.setText(self._format_time(sec))
+    def on_player_position_changed(self, abs_pos_ms: int):
+        if not self.active_clip_item:
+            return
 
-        # 先頭/末尾プレビュー中の停止リミット判定
-        if self.preview_end_limit_ms is not None and pos_ms >= self.preview_end_limit_ms:
+        item = self.active_clip_item
+        start_ms = int(item.start_sec * 1000)
+        end_ms = int(item.end_sec * 1000)
+
+        # クリップ末尾に達したら一時停止
+        if abs_pos_ms >= end_ms and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.preview_end_limit_ms = None
-            self.btn_play.setText("▶ 再生 (Space)")
-            return
+            self.player.setPosition(start_ms)
+            self.btn_play.setText("▶ 再生")
+            abs_pos_ms = start_ms
 
-        # 通常再生時、クリップ末尾に到達したら一時停止
-        if self.active_clip_item:
-            out_ms = int(self.active_clip_item.end_sec * 1000)
-            if pos_ms >= out_ms and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
-                self.player.setPosition(int(self.active_clip_item.start_sec * 1000))
-                self.btn_play.setText("▶ 再生 (Space)")
+        # クリップ内相対時間 (0 〜 クリップの長さ)
+        rel_pos_ms = max(0, abs_pos_ms - start_ms)
+        self.video_slider.set_position(rel_pos_ms)
 
-    def on_slider_position_changed(self, pos_ms: int):
-        self.preview_end_limit_ms = None
-        self.player.setPosition(pos_ms)
+        # 表示更新 (クリップ内現在位置 / クリップの長さ)
+        cur_sec = rel_pos_ms / 1000.0
+        self.lbl_current_time.setText(self._format_time(cur_sec))
 
-    # --- 【微調整機能】In点 / Out点 コマ送り・秒送り伸縮 ---
-    def adjust_in_time(self, delta_sec: float):
-        """先頭(In点)を前後させる (削り込み or 外側への余白復活)"""
+    def on_slider_position_changed(self, rel_pos_ms: int):
         if not self.active_clip_item:
             return
-        item = self.active_clip_item
-        # 0.0 以上、out_sec - 0.1 以下の範囲で自由に伸縮
-        new_in = max(0.0, min(item.start_sec + delta_sec, item.end_sec - 0.1))
-        item.start_sec = new_in
-        item.update_text()
+        start_ms = int(self.active_clip_item.start_sec * 1000)
+        abs_pos_ms = start_ms + rel_pos_ms
+        self.player.setPosition(abs_pos_ms)
 
-        # タイムラインスライダー更新
-        self._sync_slider_ranges()
-        self._update_clip_info()
-        self.update_stats()
-
-        # プレビューを即座に In 点の位置に合わせて目で確認できるようにする！
-        self.player.setPosition(int(new_in * 1000))
-
-    def adjust_out_time(self, delta_sec: float):
-        """末尾(Out点)を前後させる (削り込み or 外側への余白復活)"""
-        if not self.active_clip_item:
-            return
-        item = self.active_clip_item
-        # in_sec + 0.1 以上、total_sec 以下の範囲で自由に伸縮
-        new_out = max(item.start_sec + 0.1, min(item.end_sec + delta_sec, item.total_sec))
-        item.end_sec = new_out
-        item.update_text()
-
-        self._sync_slider_ranges()
-        self._update_clip_info()
-        self.update_stats()
-
-        # プレビューを即座に Out 点の位置に合わせて目で確認！
-        self.player.setPosition(int(new_out * 1000))
-
-    def set_current_as_in(self):
-        if not self.active_clip_item:
-            return
-        cur_sec = self.player.position() / 1000.0
-        self.active_clip_item.start_sec = min(cur_sec, self.active_clip_item.end_sec - 0.1)
-        self.active_clip_item.update_text()
-        self._sync_slider_ranges()
-        self._update_clip_info()
-        self.update_stats()
-        self.statusBar().showMessage(f"In点を設定: {self._format_time(self.active_clip_item.start_sec)}", 2000)
-
-    def set_current_as_out(self):
-        if not self.active_clip_item:
-            return
-        cur_sec = self.player.position() / 1000.0
-        self.active_clip_item.end_sec = max(cur_sec, self.active_clip_item.start_sec + 0.1)
-        self.active_clip_item.update_text()
-        self._sync_slider_ranges()
-        self._update_clip_info()
-        self.update_stats()
-        self.statusBar().showMessage(f"Out点を設定: {self._format_time(self.active_clip_item.end_sec)}", 2000)
-
-    def reset_clip_range(self):
-        if not self.active_clip_item:
-            return
-        self.active_clip_item.start_sec = 0.0
-        self.active_clip_item.end_sec = self.active_clip_item.total_sec
-        self.active_clip_item.update_text()
-        self._sync_slider_ranges()
-        self._update_clip_info()
-        self.update_stats()
-        self.statusBar().showMessage("クリップ範囲を元動画全体に戻しました", 2000)
-
-    def _sync_slider_ranges(self):
-        if not self.active_clip_item:
-            return
-        item = self.active_clip_item
-        total_ms = int(item.total_sec * 1000)
-        in_ms = int(item.start_sec * 1000)
-        out_ms = int(item.end_sec * 1000)
-        cur_ms = self.player.position()
-        self.timeline_slider.set_clip_info(total_ms, in_ms, out_ms, cur_ms)
-
-    # --- 【確認再生】先頭5秒・末尾5秒チェック ---
-    def preview_clip_head(self):
-        """In点から5秒間プレビュー再生"""
-        if not self.active_clip_item:
-            return
-        in_ms = int(self.active_clip_item.start_sec * 1000)
-        out_ms = int(self.active_clip_item.end_sec * 1000)
-        self.preview_end_limit_ms = min(out_ms, in_ms + 5000)
-        self.player.setPosition(in_ms)
-        self.player.play()
-        self.btn_play.setText("⏸ 一時停止")
-
-    def preview_clip_tail(self):
-        """Out点直前5秒からOut点までプレビュー再生"""
-        if not self.active_clip_item:
-            return
-        in_ms = int(self.active_clip_item.start_sec * 1000)
-        out_ms = int(self.active_clip_item.end_sec * 1000)
-        start_ms = max(in_ms, out_ms - 5000)
-        self.preview_end_limit_ms = out_ms
-        self.player.setPosition(start_ms)
-        self.player.play()
-        self.btn_play.setText("⏸ 一時停止")
-
-    # --- ざっくり分割 (Split) ---
+    # ========================================================
+    # 【WMM風 切り貼り編集の核心】現在位置でクリップをパカッと分割！
+    # ========================================================
     def split_current_clip(self, at_sec: Optional[float] = None):
+        """プレビューしている位置でクリップを左右2つに分割する"""
         if not self.active_clip_item:
             return
 
-        cur_sec = at_sec if at_sec is not None else (self.player.position() / 1000.0)
         item = self.active_clip_item
-        if cur_sec <= item.start_sec + 0.1 or cur_sec >= item.end_sec - 0.1:
+        cur_abs_sec = at_sec if at_sec is not None else (self.player.position() / 1000.0)
+
+        # 端すぎないかチェック
+        if cur_abs_sec <= item.start_sec + 0.1 or cur_abs_sec >= item.end_sec - 0.1:
             self.statusBar().showMessage("分割位置がクリップの端に近すぎます", 2000)
             return
 
         orig_end = item.end_sec
-        # 前半
-        item.end_sec = cur_sec
+
+        # 1. 前半クリップ
+        item.end_sec = cur_abs_sec
         item.update_text()
 
-        # 後半アイテムを直後に挿入
+        # 2. 後半クリップをストーリーボードの直後に挿入
         cur_row = self.storyboard.row(item)
         new_id = f"clip_{os.urandom(4).hex()}"
         new_item = StoryboardItem(
             clip_id=new_id,
             file_path=item.file_path,
-            start_sec=cur_sec,
+            start_sec=cur_abs_sec,
             end_sec=orig_end,
             total_sec=item.total_sec
         )
         self.storyboard.insertItem(cur_row + 1, new_item)
 
+        # 後半のサムネイル生成
         ThumbnailManager.instance().request_thumbnail(
             clip_id=new_id,
             video_path=item.file_path,
-            time_sec=cur_sec,
+            time_sec=cur_abs_sec,
             callback=self._on_thumbnail_ready
         )
 
+        # 後半を選択状態にしてプレビュー
         self.storyboard.setCurrentItem(new_item)
         self.on_clip_selected(new_item)
         self.update_stats()
-        self.statusBar().showMessage(f"✂ クリップを分割しました: {self._format_time(cur_sec)}", 3000)
+        self.statusBar().showMessage(f"分割しました", 2000)
 
-    # --- UI表示更新 ---
+    # --- 表示更新 ---
     def _update_base_info(self):
         if not self.base_meta:
-            self.lbl_base_file.setText("基準動画: 未設定")
+            self.lbl_base_file.setText("ファイル: 未設定")
             self.lbl_base_res.setText("解像度: -")
             self.lbl_base_codec.setText("コーデック: -")
             return
-        self.lbl_base_file.setText(f"基準: {self.base_meta.file_name}")
-        self.lbl_base_res.setText(f"解像度: {self.base_meta.width}x{self.base_meta.height} ({self.base_meta.fps}fps)")
-        self.lbl_base_codec.setText(f"形式: {self.base_meta.video_codec} / {self.base_meta.audio_codec or '無音'}")
+        self.lbl_base_file.setText(f"{self.base_meta.file_name}")
+        self.lbl_base_res.setText(f"{self.base_meta.width}x{self.base_meta.height} ({self.base_meta.fps}fps)")
+        self.lbl_base_codec.setText(f"{self.base_meta.video_codec} / {self.base_meta.audio_codec or '無音'}")
 
     def _update_clip_info(self):
         if not self.active_clip_item:
-            self.lbl_clip_name.setText("ファイル: -")
-            self.lbl_clip_in.setText("In 点: -")
-            self.lbl_clip_out.setText("Out 点: -")
+            self.lbl_clip_name.setText("名前: -")
+            self.lbl_clip_in.setText("開始: -")
+            self.lbl_clip_out.setText("終了: -")
             self.lbl_clip_len.setText("長さ: -")
             self.lbl_total_time.setText("00:00:00.000")
-            self.lbl_clip_range.setText("選択中クリップ範囲: 未選択")
-            self.lbl_in_value.setText("00:00:00.000")
-            self.lbl_out_value.setText("00:00:00.000")
+            self.lbl_clip_name_banner.setText("")
             return
 
         item = self.active_clip_item
         dur = item.end_sec - item.start_sec
-        self.lbl_clip_name.setText(f"ファイル: {item.file_name}")
-        self.lbl_clip_in.setText(f"In 点: {self._format_time(item.start_sec)}")
-        self.lbl_clip_out.setText(f"Out 点: {self._format_time(item.end_sec)}")
-        self.lbl_clip_len.setText(f"長さ: {self._format_time(dur)}")
-        self.lbl_total_time.setText(self._format_time(item.total_sec))
-
-        self.lbl_in_value.setText(self._format_time(item.start_sec))
-        self.lbl_out_value.setText(self._format_time(item.end_sec))
-        self.lbl_clip_range.setText(
-            f"クリップ範囲: {self._format_time(item.start_sec)} 〜 {self._format_time(item.end_sec)} ({self._format_time(dur)})"
-        )
+        self.lbl_clip_name.setText(f"{item.file_name}")
+        self.lbl_clip_in.setText(f"{self._format_time(item.start_sec)}")
+        self.lbl_clip_out.setText(f"{self._format_time(item.end_sec)}")
+        self.lbl_clip_len.setText(f"{self._format_time(dur)}")
+        self.lbl_total_time.setText(self._format_time(dur))
+        self.lbl_clip_name_banner.setText(f"[{item.file_name}]")
 
     def update_stats(self):
         count = self.storyboard.count()
@@ -752,7 +546,7 @@ class MainWindow(QMainWindow):
             if isinstance(item, StoryboardItem):
                 total_sec += (item.end_sec - item.start_sec)
 
-        self.lbl_base_clips.setText(f"総クリップ数: {count} 本")
+        self.lbl_base_clips.setText(f"クリップ数: {count} 本")
         m, s = divmod(int(total_sec), 60)
         h, m = divmod(m, 60)
         self.lbl_base_dur.setText(f"合計時間: {h:02d}:{m:02d}:{s:02d}")
@@ -802,15 +596,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "保存するクリップがありません。")
             return
 
-        # デフォルト名は元ファイル名(1)_recipe.json
         first_item = self.storyboard.item(0)
-        default_name = "cmmm_recipe.json"
+        default_name = "recipe.json"
         if isinstance(first_item, StoryboardItem):
             base, _ = os.path.splitext(first_item.file_path)
-            default_name = f"{base}_recipe.json"
+            default_name = f"{base}.json"
 
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "レシピ保存先", default_name, "JSON レシピ (*.json)"
+            self, "レシピ保存", default_name, "JSON (*.json)"
         )
         if not save_path:
             return
@@ -826,21 +619,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "エクスポートするクリップがありません。")
             return
 
-        # 出力ファイル名: 元の名前(1).mp4 を初期値として自動生成！
         first_item = self.storyboard.item(0)
-        default_out = "output_cmmm.mp4"
+        default_out = "output(1).mp4"
         if isinstance(first_item, StoryboardItem):
             default_out = generate_default_output_path(first_item.file_path)
 
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "動画書き出し先", default_out, "動画ファイル (*.mp4 *.mkv);;すべてのファイル (*.*)"
+            self, "エクスポート", default_out, "動画 (*.mp4 *.mkv);;すべて (*.*)"
         )
         if not save_path:
             return
 
         recipe = self._build_recipe(save_path)
 
-        self.progress_dialog = QProgressDialog("動画を書き出し中...", "キャンセル", 0, 100, self)
+        self.progress_dialog = QProgressDialog("書き出し中...", "キャンセル", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dialog.setMinimumDuration(0)
         self.progress_dialog.setValue(0)
@@ -851,7 +643,7 @@ class MainWindow(QMainWindow):
 
             try:
                 execute_recipe(recipe, progress_callback=progress_cb)
-                self.exportFinishedSignal.emit(True, f"書き出しが完了しました！\n\n出力先:\n{save_path}")
+                self.exportFinishedSignal.emit(True, f"書き出しが完了しました:\n{save_path}")
             except Exception as e:
                 self.exportFinishedSignal.emit(False, str(e))
 
@@ -867,7 +659,7 @@ class MainWindow(QMainWindow):
         if success:
             QMessageBox.information(self, "完了", msg)
         else:
-            QMessageBox.critical(self, "エクスポート失敗", f"エラーが発生しました:\n{msg}")
+            QMessageBox.critical(self, "エラー", f"失敗しました:\n{msg}")
 
     @staticmethod
     def _format_time(sec: float) -> str:
