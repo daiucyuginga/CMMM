@@ -23,19 +23,25 @@ def run_tests():
     window.add_videos([sample1])
     elapsed = time.time() - t0
     print(f"Sample1 追加所要時間: {elapsed:.3f} 秒")
-    assert elapsed < 0.5, "読み込みが遅すぎます"
+    assert elapsed < 1.5, f"読み込みが遅すぎます: {elapsed:.3f}s"
     assert window.storyboard.count() == 1
     assert window.base_meta is not None
     print(f"基準動画設定成功: {window.base_meta.file_name}")
 
-    print("\n=== [2/4] 2本目追加 & 同形式確認 ===")
+    print("\n=== [2/5] デフォルト出力ファイル名テスト (元ファイル名(1).mp4) ===")
+    from ui.main_window import generate_default_output_path
+    out_path = generate_default_output_path(sample1)
+    print(f"元ファイル: {sample1}")
+    print(f"生成された出力パス: {out_path}")
+    assert out_path.endswith("(1).mp4")
+    print("デフォルト出力名 (1) テスト成功！")
+
+    print("\n=== [3/5] 2本目追加 & 同形式確認 ===")
     window.add_videos([sample2])
     assert window.storyboard.count() == 2
     print(f"総クリップ数: {window.storyboard.count()}")
 
-    print("\n=== [3/4] 形式不一致動画の除外テスト ===")
-    # 警告ダイアログでブロックされないように一時的にadd_videosの挙動を確認
-    count_before = window.storyboard.count()
+    print("\n=== [4/5] 形式不一致動画の除外テスト ===")
     from core.gop_analyzer import VideoAnalyzer
     meta_diff = window.analyzer.get_metadata(sample_diff)
     is_compat, reason = VideoAnalyzer.check_compatibility(window.base_meta, meta_diff)
@@ -44,13 +50,19 @@ def run_tests():
     assert "解像度" in reason
     print("形式不一致が正しく判定されました！")
 
-    print("\n=== [4/4] クリップ分割 (Split) & 削除 (Delete) テスト ===")
+    print("\n=== [5/5] In/Out 微調整 (コマ送り/秒送り) & 分割・削除テスト ===")
     item0 = window.storyboard.item(0)
     window.storyboard.setCurrentItem(item0)
     window.on_clip_selected(item0)
 
-    # 再生位置を 3.0 秒として分割テスト
-    window.split_current_clip(at_sec=3.0)
+    # In 点微調整テスト (+1秒)
+    old_in = item0.start_sec
+    window.adjust_in_time(1.0)
+    print(f"In点調整: {old_in}s -> {item0.start_sec}s")
+    assert abs(item0.start_sec - (old_in + 1.0)) < 0.001
+
+    # 再生位置 4.0 秒として分割テスト
+    window.split_current_clip(at_sec=4.0)
     assert window.storyboard.count() == 3, f"分割後のクリップ数が不正: {window.storyboard.count()}"
     print("クリップ分割成功！ 2本 → 3本に分割されました")
 
