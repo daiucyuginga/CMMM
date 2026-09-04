@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# 動画・バイナリファイル (GitHubに重い動画を上げないため)
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.ts
+*.flv
+samples/*.mp4
+samples/*.mkv
+
+# 一時ファイル
+cmmm_temp_*
+*.tmp
+*.log
+
+# IDE
+.vscode/
+.idea/

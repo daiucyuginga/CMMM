@@ -1,0 +1,16 @@
+{
+  "mode": "smart",
+  "output_file": "C:\\Projects_Apps\\my_Projects\\CMMM\\samples\\out_cli.mp4",
+  "clips": [
+    {
+      "source": "C:\\Projects_Apps\\my_Projects\\CMMM\\samples\\sample1.mp4",
+      "start": 0.5,
+      "end": 3.5
+    },
+    {
+      "source": "C:\\Projects_Apps\\my_Projects\\CMMM\\samples\\sample2.mp4",
+      "start": 1.0,
+      "end": 4.0
+    }
+  ]
+}

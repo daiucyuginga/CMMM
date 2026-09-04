@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CMMM - 無劣化スマート動画エディタ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- アプリヘッダー / ツールバー -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-icon">🎬</span>
+        <span class="logo-text">CMMM</span>
+        <span class="logo-sub">Smart Video Editor</span>
+      </div>
+      <button id="btnAddVideo" class="btn btn-primary">
+        <span class="icon">➕</span> 動画を追加
+      </button>
+    </div>
+
+    <div class="header-center">
+      <!-- モード切り替えトグルスイッチ -->
+      <div class="mode-switch-container">
+        <span class="mode-label">処理モード:</span>
+        <div class="toggle-pill" id="modeToggle">
+          <button class="toggle-option active" data-mode="lossless">
+            <span class="mode-icon">⚡</span> 完全無劣化
+          </button>
+          <button class="toggle-option" data-mode="smart">
+            <span class="mode-icon">🎯</span> スマートカット
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <button id="btnSaveRecipe" class="btn btn-secondary">
+        <span class="icon">💾</span> レシピ保存
+      </button>
+      <button id="btnExport" class="btn btn-accent">
+        <span class="icon">🚀</span> エクスポート
+      </button>
+    </div>
+  </header>
+
+  <!-- メインコンテンツ -->
+  <main class="main-content">
+    <!-- プレビュー＆プレイヤーセクション -->
+    <section class="preview-section">
+      <div class="video-wrapper">
+        <video id="videoPlayer" preload="metadata"></video>
+        <div id="videoPlaceholder" class="video-placeholder">
+          <div class="placeholder-icon">📂</div>
+          <div class="placeholder-text">動画ファイルをここにドラッグ＆ドロップ</div>
+          <div class="placeholder-sub">または上の「動画を追加」ボタンをクリック</div>
+        </div>
+      </div>
+
+      <!-- タイムライン / シークバー -->
+      <div class="timeline-bar-wrapper">
+        <div class="timeline-header">
+          <div class="time-display">
+            <span id="currentTime">00:00:00.000</span>
+            <span class="time-sep">/</span>
+            <span id="clipDuration">00:00:00.000</span>
+          </div>
+          <div class="clip-range-display">
+            クリップ範囲: <span id="rangeIn">00:00:00.000</span> 〜 <span id="rangeOut">00:00:00.000</span>
+          </div>
+        </div>
+
+        <!-- In/Outレンジ付きシークバー -->
+        <div class="seek-container" id="seekContainer">
+          <div class="seek-track">
+            <!-- 選択範囲のハイライト -->
+            <div class="range-highlight" id="rangeHighlight"></div>
+            <!-- In点ハンドル -->
+            <div class="range-handle handle-in" id="handleIn" title="開始位置 (In点)"></div>
+            <!-- Out点ハンドル -->
+            <div class="range-handle handle-out" id="handleOut" title="終了位置 (Out点)"></div>
+            <!-- 再生ヘッド -->
+            <div class="playhead" id="playhead"></div>
+          </div>
+        </div>
+
+        <!-- 操作コントロール -->
+        <div class="controls-row">
+          <div class="controls-left">
+            <button class="btn-ctrl" id="btnPrevKeyframe" title="前のキーフレーム (Shift+←)">⏮ KF</button>
+            <button class="btn-ctrl" id="btnStepBack" title="1フレーム戻る (←)">◀ 1F</button>
+            <button class="btn-ctrl btn-play" id="btnPlayPause" title="再生 / 一時停止 (Space)">▶</button>
+            <button class="btn-ctrl" id="btnStepForward" title="1フレーム進む (→)">1F ▶</button>
+            <button class="btn-ctrl" id="btnNextKeyframe" title="次のキーフレーム (Shift+→)">KF ⏭</button>
+          </div>
+
+          <div class="controls-center">
+            <button class="btn-action" id="btnSetIn" title="現在位置を開始点に設定 (I)">[ In点設定 (I)</button>
+            <button class="btn-action btn-split" id="btnSplit" title="ここで分割 (S)">✂ ここで分割 (S)</button>
+            <button class="btn-action" id="btnSetOut" title="現在位置を終了点に設定 (O)">Out点設定 (O) ]</button>
+          </div>
+
+          <div class="controls-right">
+            <button class="btn-ctrl-sub" id="btnResetRange" title="クリップ範囲を全体にリセット">↺ リセット</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右サイドバー：クリップ＆プロジェクト情報 -->
+    <aside class="sidebar-section">
+      <div class="sidebar-card">
+        <h3 class="card-title">プロジェクト基準</h3>
+        <div class="info-grid" id="projectBaseInfo">
+          <div class="info-row"><span class="label">基準動画:</span> <span class="val" id="baseFileName">-</span></div>
+          <div class="info-row"><span class="label">解像度:</span> <span class="val" id="baseResolution">-</span></div>
+          <div class="info-row"><span class="label">映像形式:</span> <span class="val" id="baseVideoCodec">-</span></div>
+          <div class="info-row"><span class="label">音声形式:</span> <span class="val" id="baseAudioCodec">-</span></div>
+          <div class="info-row"><span class="label">総クリップ数:</span> <span class="val" id="totalClipsCount">0</span></div>
+          <div class="info-row"><span class="label">合計時間:</span> <span class="val" id="totalDuration">00:00:00</span></div>
+        </div>
+      </div>
+
+      <div class="sidebar-card">
+        <h3 class="card-title">選択中のクリップ</h3>
+        <div class="info-grid" id="selectedClipInfo">
+          <div class="info-row"><span class="label">元ファイル:</span> <span class="val text-truncate" id="selFileName">-</span></div>
+          <div class="info-row"><span class="label">開始位置:</span> <span class="val" id="selStart">-</span></div>
+          <div class="info-row"><span class="label">終了位置:</span> <span class="val" id="selEnd">-</span></div>
+          <div class="info-row"><span class="label">長さ:</span> <span class="val" id="selDuration">-</span></div>
+        </div>
+      </div>
+
+      <div class="sidebar-tips">
+        <h4>ショートカットキー</h4>
+        <ul>
+          <li><kbd>Space</kbd> : 再生 / 一時停止</li>
+          <li><kbd>S</kbd> : 現在位置でクリップ分割</li>
+          <li><kbd>I</kbd> / <kbd>O</kbd> : In点 / Out点設定</li>
+          <li><kbd>←</kbd> / <kbd>→</kbd> : 1フレーム送り / 戻し</li>
+          <li><kbd>Delete</kbd> : クリップ削除</li>
+        </ul>
+      </div>
+    </aside>
+  </main>
+
+  <!-- 下部：WMM風 ストーリーボード -->
+  <footer class="storyboard-section">
+    <div class="storyboard-header">
+      <span class="storyboard-title">🎞️ ストーリーボード（ドラッグ＆ドロップで並び替え）</span>
+      <span class="storyboard-hint">💡 クリップを掴んで順番を並び替えたり、クリックしてトリミング調整できます</span>
+    </div>
+    <div class="storyboard-container" id="storyboardList">
+      <!-- JavaScriptで動的にカードを挿入 -->
+    </div>
+  </footer>
+
+  <!-- 全面ファイルドロップオーバーレイ -->
+  <div class="drop-overlay" id="dropOverlay">
+    <div class="drop-overlay-box">
+      <div class="drop-icon">📥</div>
+      <div class="drop-text">動画ファイルをここにドロップ</div>
+      <div class="drop-desc">無劣化結合の互換性を自動チェックして追加します</div>
+    </div>
+  </div>
+
+  <!-- エクスポート進捗モーダル -->
+  <div class="modal" id="exportModal">
+    <div class="modal-box">
+      <h3 class="modal-title">動画を書き出し中...</h3>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="exportProgressBar" style="width: 0%;"></div>
+      </div>
+      <div class="progress-status" id="exportProgressText">準備中...</div>
+      <div class="modal-actions">
+        <button id="btnCancelExport" class="btn btn-secondary" style="display: none;">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- トースト通知コンテナ -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- スクリプト -->
+  <script src="qwebchannel.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
