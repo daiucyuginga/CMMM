@@ -208,7 +208,7 @@ class MainWindow(QMainWindow):
         self.btn_split = QPushButton("✂ ここで分割 (S)")
         self.btn_split.setObjectName("splitButton")
         self.btn_split.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px; background-color: rgba(96, 205, 255, 0.18); border: 2px solid #60cdff; color: #60cdff;")
-        self.btn_split.clicked.connect(self.split_current_clip)
+        self.btn_split.clicked.connect(lambda: self.split_current_clip())
         ctrl_layout.addWidget(self.btn_split)
 
         ctrl_layout.addStretch()
@@ -269,6 +269,7 @@ class MainWindow(QMainWindow):
 
         # --- 下部：ストーリーボード ---
         sb_container = QWidget()
+        sb_container.setMinimumHeight(220)
         sb_layout = QVBoxLayout(sb_container)
         sb_layout.setContentsMargins(0, 0, 0, 0)
         sb_layout.setSpacing(4)
@@ -291,8 +292,9 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self.storyboard)
 
         v_splitter.addWidget(sb_container)
-        v_splitter.setStretchFactor(0, 3)
-        v_splitter.setStretchFactor(1, 1)
+        v_splitter.setStretchFactor(0, 5)
+        v_splitter.setStretchFactor(1, 2)
+        v_splitter.setSizes([520, 240])
 
         self.statusBar().showMessage("準備完了")
 
@@ -469,10 +471,15 @@ class MainWindow(QMainWindow):
             return
 
         item = self.active_clip_item
-        cur_abs_sec = at_sec if at_sec is not None else (self.player.position() / 1000.0)
+        if isinstance(at_sec, bool) or at_sec is None:
+            # ユーザーがシークバーで指定した位置を基準に計算
+            rel_sec = self.video_slider.position_ms / 1000.0
+            cur_abs_sec = item.start_sec + rel_sec
+        else:
+            cur_abs_sec = float(at_sec)
 
-        # 端すぎないかチェック
-        if cur_abs_sec <= item.start_sec + 0.1 or cur_abs_sec >= item.end_sec - 0.1:
+        # 端すぎないかチェック (先頭/末尾から0.1秒以上内側)
+        if cur_abs_sec <= item.start_sec + 0.05 or cur_abs_sec >= item.end_sec - 0.05:
             self.statusBar().showMessage("分割位置がクリップの端に近すぎます", 2000)
             return
 

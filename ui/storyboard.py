@@ -49,8 +49,9 @@ class StoryboardWidget(QListWidget):
         self.setFlow(QListWidget.Flow.LeftToRight)
         self.setWrapping(False)
         self.setIconSize(QSize(160, 90))
-        self.setGridSize(QSize(176, 134))
-        self.setSpacing(8)
+        self.setGridSize(QSize(180, 160))
+        self.setSpacing(10)
+        self.setMinimumHeight(180)
 
         # ネイティブ DnD 設定
         self.setDragEnabled(True)

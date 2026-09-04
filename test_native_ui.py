@@ -55,10 +55,11 @@ def run_tests():
     window.storyboard.setCurrentItem(item0)
     window.on_clip_selected(item0)
 
-    # 再生位置 4.0 秒として分割テスト
-    window.split_current_clip(at_sec=4.0)
+    # シークバーを 4.0 秒に設定して、ボタンクリックによる分割テスト！
+    window.video_slider.set_position(4000)
+    window.btn_split.click()
     assert window.storyboard.count() == 3, f"分割後のクリップ数が不正: {window.storyboard.count()}"
-    print("クリップ分割成功！ 2本 → 3本に分割されました")
+    print("【分割ボタンクリック】成功！ 2本 → 3本に分割されました")
 
     # 選択クリップを削除
     window.storyboard.delete_selected()
