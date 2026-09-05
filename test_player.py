@@ -8,9 +8,16 @@ import sys
 import json
 import time
 import tempfile
+
+# Windows コンソールでの文字エンコードエラー防止
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QEvent
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import Qt, QEvent, QMimeData, QUrl, QPointF
+from PySide6.QtGui import QKeyEvent, QDropEvent
 from PySide6.QtMultimedia import QMediaPlayer
 
 from ui.player_window import PlayerWindow
@@ -21,16 +28,41 @@ if not app:
     app = QApplication(sys.argv)
 
 
-def run_player_tests():
-    sample1 = os.path.abspath("samples/sample1.mp4")
-    assert os.path.exists(sample1), f"テスト用動画が見つかりません: {sample1}"
+def log_trace(msg):
+    print(msg, flush=True)
+    with open("test_run.log", "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
 
-    print("\n=== [1/6] プレイヤー初期化 ＆ 動画読み込みテスト ===")
+def run_player_tests():
+    with open("test_run.log", "w", encoding="utf-8") as f:
+        f.write("=== START ===\n")
+    sample1 = os.path.abspath("samples/sample1.mp4")
+    sample2 = os.path.abspath("samples/sample2.mp4")
+    assert os.path.exists(sample1), f"テスト用動画が見つかりません: {sample1}"
+    assert os.path.exists(sample2), f"テスト用動画が見つかりません: {sample2}"
+
+    print("\n=== [1/6] プレイヤー初期化 ＆ 動画読み込み ＆ 再生画面へのドロップテスト ===")
     player_win = PlayerWindow()
     player_win.open_video(sample1)
     assert player_win.file_path == sample1
     assert player_win.lbl_file_name.text() == os.path.basename(sample1)
     print("動画オープン成功:", sample1)
+
+    # 再生画面 (video_widget) へのドラッグ＆ドロップテスト
+    mime2 = QMimeData()
+    mime2.setUrls([QUrl.fromLocalFile(sample2)])
+    drop_ev2 = QDropEvent(QPointF(100, 100), Qt.DropAction.CopyAction, mime2, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+    player_win.video_widget.dropEvent(drop_ev2)
+    assert player_win.file_path == sample2
+    assert player_win.lbl_file_name.text() == os.path.basename(sample2)
+
+    mime1 = QMimeData()
+    mime1.setUrls([QUrl.fromLocalFile(sample1)])
+    drop_ev1 = QDropEvent(QPointF(100, 100), Qt.DropAction.CopyAction, mime1, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+    player_win.video_widget.dropEvent(drop_ev1)
+    assert player_win.file_path == sample1
+    assert player_win.lbl_file_name.text() == os.path.basename(sample1)
+    print("再生画面へのドラッグ＆ドロップによる動画読み込み 成功！")
 
     print("\n=== [2/6] 全画面（フルスクリーン）トグル ＆ マウスホバー表示判定テスト ===")
     player_win.enter_fullscreen()
@@ -58,34 +90,92 @@ def run_player_tests():
     print("全画面解除（レイアウト復帰 ＆ 常時表示化）成功！")
 
     print("\n=== [2.5/6] スキップ時間セレクター ＆ ジャンプショートカットテスト ===")
+    # 初期状態は「5秒」
     assert player_win.skip_seconds_value == 5
     assert player_win.btn_skip_prev.text() == "◀ 5秒"
     assert player_win.btn_skip_next.text() == "5秒 ▶"
 
-    # 30秒に変更
+    # 10秒に変更 (index 1)
+    player_win.combo_skip.setCurrentIndex(1)
+    assert player_win.skip_seconds_value == 10
+    assert player_win.btn_skip_prev.text() == "◀ 10秒"
+    assert player_win.btn_skip_next.text() == "10秒 ▶"
+
+    # 30秒に変更 (index 2)
     player_win.combo_skip.setCurrentIndex(2)
     assert player_win.skip_seconds_value == 30
     assert player_win.btn_skip_prev.text() == "◀ 30秒"
     assert player_win.btn_skip_next.text() == "30秒 ▶"
 
-    # 5分に変更
+    # 5分に変更 (index 4)
     player_win.combo_skip.setCurrentIndex(4)
     assert player_win.skip_seconds_value == 300
     assert player_win.btn_skip_prev.text() == "◀ 5分"
     assert player_win.btn_skip_next.text() == "5分 ▶"
 
-    # 5秒に戻す
+    # 5秒に戻す (index 0)
     player_win.combo_skip.setCurrentIndex(0)
     assert player_win.skip_seconds_value == 5
-    print("スキップ設定切替（5秒/30秒/5分）＆ ボタン表記連動 成功！")
+    assert player_win.btn_skip_prev.text() == "◀ 5秒"
+    assert player_win.btn_skip_next.text() == "5秒 ▶"
+    print("スキップ設定切替（5秒/10秒/30秒/5分）＆ ボタン表記連動 成功！")
 
-    # ジャンプ機能テスト
-    player_win.seek(5000)
-    player_win.skip_seconds(3)    # 3秒進む
-    assert player_win.slider.position_ms == 8000
-    player_win.skip_seconds(-4)   # 4秒戻る
+    # 秒数スキップ ＆ 連続キー入力デバウンス（累積加算）テスト
+    # sample1.mp4 は 10秒 (10000ms) なので 1000ms を基準にテスト
+    player_win.seek(1000, immediate=True)
+    assert player_win.slider.position_ms == 1000
+
+    # 1回スキップ (2秒)
+    player_win.skip_seconds(2)
+    assert player_win.slider.position_ms == 3000
+    assert player_win._pending_seek_ms == 3000
+    assert player_win._seek_debounce_timer.isActive() is True
+
+    # タイマーが切れる前にさらに2回スキップ（連打シミュレーション: +2秒, +2秒）
+    player_win.skip_seconds(2)  # -> 5000
+    assert player_win.slider.position_ms == 5000
+    assert player_win._pending_seek_ms == 5000
+    player_win.skip_seconds(2)  # -> 7000
+    assert player_win.slider.position_ms == 7000
+    assert player_win._pending_seek_ms == 7000
+
+    # デバウンスタイムアウト実行 -> 実プレイヤーへのシーク反映
+    player_win._apply_pending_seek()
+    assert player_win._pending_seek_ms is None
+    assert player_win.slider.position_ms == 7000
+    print("スマートシーク（即時UI更新 ＆ 連打時の累積加算 ＆ デバウンス実シーク）テスト 成功！")
+
+    # 逆方向スキップ (-3秒)
+    player_win.skip_seconds(-3)
     assert player_win.slider.position_ms == 4000
-    print("ジャンプショートカット（5秒/30秒/1分/5分）テスト 成功！")
+    player_win._apply_pending_seek()
+    assert player_win._pending_seek_ms is None
+    assert player_win.slider.position_ms == 4000
+    print("逆方向秒数スキップテスト 成功！")
+
+    # キーフレームスキップテスト (Alt+Left / Alt+Right)
+    player_win.set_keyframes([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    player_win.seek(2000, immediate=True)   # 2.0秒
+    player_win.skip_keyframe(1)   # 次のキーフレーム (3.0秒)
+    assert player_win.slider.position_ms == 3000
+    player_win.skip_keyframe(1)   # 次のキーフレーム (4.0秒)
+    assert player_win.slider.position_ms == 4000
+    player_win.skip_keyframe(-1)  # 前のキーフレーム (3.0秒)
+    assert player_win.slider.position_ms == 3000
+    player_win.skip_keyframe(-1)  # 前のキーフレーム (2.0秒)
+    assert player_win.slider.position_ms == 2000
+    print("キーフレーム単位スキップ（前後のキーフレームへ吸着ジャンプ）テスト 成功！")
+
+    # キーイベントによるスキップテスト (Left / Right, 5秒プリセット)
+    player_win.seek(3000, immediate=True)
+    ev_right = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier)
+    player_win.keyPressEvent(ev_right)  # 3000 + 5000 = 8000
+    assert player_win.slider.position_ms == 8000
+    ev_left = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier)
+    player_win.keyPressEvent(ev_left)   # 8000 - 5000 = 3000
+    assert player_win.slider.position_ms == 3000
+    player_win._apply_pending_seek()
+    print("Left/Rightキーによるスキップテスト 成功！")
 
     print("\n=== [3/6] 音量コントロール ＆ ミュートテスト ===")
     # 音量スライダー変更
@@ -93,7 +183,19 @@ def run_player_tests():
     assert player_win.lbl_volume.text() == "80%"
     assert abs(player_win.audio_output.volume() - 0.8) < 0.01
 
-    # 音量微調整
+    # 上下キーによる音量ショートカットテスト (Up: +5%, Down: -5%)
+    ev_up = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
+    player_win.keyPressEvent(ev_up)
+    assert player_win.volume_slider.value() == 85
+    assert player_win.lbl_volume.text() == "85%"
+
+    ev_down = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier)
+    player_win.keyPressEvent(ev_down)
+    assert player_win.volume_slider.value() == 80
+    assert player_win.lbl_volume.text() == "80%"
+    print("上下キー音量ショートカット（Up/Down による 5% 単位変更）テスト 成功！")
+
+    # 音量微調整メソッド
     player_win.change_volume(5)
     assert player_win.lbl_volume.text() == "85%"
 
@@ -244,7 +346,19 @@ def run_player_tests():
             os.remove(tmp_json)
 
     print("\n[SUCCESS] CMMM プレイヤーおよび本体連携テストがすべて正常に通過しました！")
+    log_trace("[SUCCESS] ALL PLAYER TESTS PASSED!")
 
 
 if __name__ == "__main__":
-    run_player_tests()
+    try:
+        run_player_tests()
+        print("\nALL PLAYER TESTS PASSED!")
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with open("test_err.log", "w", encoding="utf-8") as f:
+            traceback.print_exc(file=f)
+        sys.exit(1)
