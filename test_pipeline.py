@@ -64,7 +64,7 @@ def test_all():
     out_meta = analyzer.get_metadata(lossless_out)
     print(f"完全無劣化出力成功！ 長さ: {out_meta.duration:.2f}s, サイズ: {os.path.getsize(lossless_out)} bytes")
 
-    print("\n=== [5/5] スマートカット（ミリ秒精度）結合テスト ===")
+    print("\n=== [5/6] スマートカット（ミリ秒精度）結合テスト ===")
     smart_out = os.path.abspath("samples/out_smart.mp4")
     if os.path.exists(smart_out):
         os.remove(smart_out)
@@ -78,6 +78,27 @@ def test_all():
     assert os.path.exists(smart_out), "スマートカット出力ファイルが存在しません"
     smart_meta = analyzer.get_metadata(smart_out)
     print(f"スマートカット出力成功！ 長さ: {smart_meta.duration:.2f}s, サイズ: {os.path.getsize(smart_out)} bytes")
+
+    print("\n=== [6/6] 単一クリップ直接出力（二重コピー完全ゼロ化）テスト ===")
+    single_lossless_out = os.path.abspath("samples/out_single_lossless.mp4")
+    if os.path.exists(single_lossless_out):
+        os.remove(single_lossless_out)
+    clips_single_lossless = [
+        ClipSegment(os.path.abspath("samples/sample1.mp4"), 1.0, 5.0)
+    ]
+    cutter.process_clips(clips_single_lossless, single_lossless_out, mode="lossless")
+    assert os.path.exists(single_lossless_out), "単一クリップ完全無劣化出力が存在しません"
+    print(f"単一クリップ無劣化直接出力成功！ サイズ: {os.path.getsize(single_lossless_out)} bytes")
+
+    single_smart_out = os.path.abspath("samples/out_single_smart.mp4")
+    if os.path.exists(single_smart_out):
+        os.remove(single_smart_out)
+    clips_single_smart = [
+        ClipSegment(os.path.abspath("samples/sample1.mp4"), 1.250, 4.750)
+    ]
+    cutter.process_clips(clips_single_smart, single_smart_out, mode="smart")
+    assert os.path.exists(single_smart_out), "単一クリップスマートカット出力が存在しません"
+    print(f"単一クリップスマートカット直接出力成功！ サイズ: {os.path.getsize(single_smart_out)} bytes")
 
     print("\n=== レシピJSON経由のCLI実行テスト ===")
     recipe_path = os.path.abspath("samples/test_recipe.json")

@@ -99,7 +99,7 @@ class FFmpegRunner:
         if not self.ffmpeg_path:
             raise FileNotFoundError("ffmpeg が見つかりません。FFmpeg をインストールしてください。")
 
-        cmd = [self.ffmpeg_path, "-hide_banner", "-y", *args]
+        cmd = [self.ffmpeg_path, "-nostdin", "-hide_banner", "-y", *args]
         logger.info(f"Running ffmpeg: {' '.join(cmd)}")
 
         kwargs = {}
@@ -108,6 +108,7 @@ class FFmpegRunner:
 
         process = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             **kwargs

@@ -9,6 +9,8 @@ import json
 import time
 import tempfile
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt, QEvent
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtMultimedia import QMediaPlayer
 
 from ui.player_window import PlayerWindow
@@ -121,38 +123,92 @@ def run_player_tests():
     assert player_win.btn_speed_reset.text() == "1.0x"
     print("速度調整ステップボタンテスト 成功！")
 
-    print("\n=== [5/6] 視聴中 In/Out マーキング ＆ 区間登録テスト ===")
-    # 区間 1: 1.5秒 ～ 4.0秒
-    player_win.seek(1500)
-    player_win.set_mark_in()
-    assert player_win.mark_in_sec == 1.5
-    assert player_win.slider.mark_in_ms == 1500
+    print("\n=== [5/6] 分割位置マーキング（Mキー）＆ 前後ジャンプ（M+Left/Right）テスト ===")
+    player_win.clear_all_markers()
+    assert len(player_win.markers) == 0
 
-    player_win.seek(4000)
-    player_win.set_mark_out()
-    assert player_win.mark_in_sec is None
-    assert len(player_win.clips) == 1
-    assert player_win.clips[0] == (1.5, 4.0)
+    # マーク 1: 3.0秒
+    player_win.seek(3000)
+    player_win.toggle_marker()
+    assert len(player_win.markers) == 1
+    assert player_win.markers[0] == 3.0
+    assert player_win.marker_list_widget.count() == 1
 
-    # 区間 2: 6.0秒 ～ 8.5秒
-    player_win.seek(6000)
-    player_win.set_mark_in()
-    player_win.seek(8500)
-    player_win.set_mark_out()
-    assert len(player_win.clips) == 2
-    assert player_win.clips[1] == (6.0, 8.5)
-    assert player_win.clip_list_widget.count() == 2
-    print(f"2つの区間を正常にマーク登録: {player_win.clips}")
+    # マーク 2: 7.0秒
+    player_win.seek(7000)
+    player_win.toggle_marker()
+    assert len(player_win.markers) == 2
+    assert player_win.markers == [3.0, 7.0]
+    assert player_win.marker_list_widget.count() == 2
+    print(f"2つの分割マークを正常に登録: {player_win.markers}")
 
-    print("\n=== [6/6] レシピ生成 ＆ CMMM本体での読み込み相互連携テスト ===")
+    # Jキー（前のマーク） / Lキー（次のマーク）によるジャンプテスト
+    player_win.seek(7000)
+    player_win.jump_to_marker(-1)  # Jキー相当: 前のマーク (3.0秒) へ
+    assert player_win.slider.position_ms == 3000
+    print("Jキー（前のマークへジャンプ: 3.0秒）テスト 成功！")
+
+    player_win.jump_to_marker(1)   # Lキー相当: 次のマーク (7.0秒) へ
+    assert player_win.slider.position_ms == 7000
+    print("Lキー（次のマークへジャンプ: 7.0秒）テスト 成功！")
+
+    # --- [NEW] シークバー独立動作テスト（シークしてもマーカーが動かない） ---
+    player_win.slider.dragging = True
+    player_win.slider.position_ms = 5000
+    player_win.slider.dragging = False
+    assert player_win.markers == [3.0, 7.0], "シークバー操作でマーカーが動いてはいけません"
+    print("シークバーの独立動作（シークバー操作でマーカー不変）テスト 成功！")
+
+    # --- [NEW] Shift+M（現在位置へ移動）テスト ---
+    # 4.5秒にシークして、3.0秒のマーカーを 4.5秒へ移動
+    player_win.seek(4500)
+    player_win.marker_list_widget.setCurrentRow(0)  # 3.0秒のマーカーを選択
+    player_win.move_selected_marker_to_current()
+    assert player_win.markers == [4.5, 7.0]
+    print("Shift+M（選択マークを 4.5秒へ移動）テスト 成功！")
+
+    # --- [NEW] Undo（Ctrl+Z: 元に戻す）テスト ---
+    player_win.undo()
+    assert player_win.markers == [3.0, 7.0], f"Undo失敗: markers={player_win.markers}"
+    print("Undo（Ctrl+Z: 移動前の 3.0秒へ復元）テスト 成功！")
+
+    # --- [NEW] Redo（Ctrl+Y: やり直す）テスト ---
+    player_win.redo()
+    assert player_win.markers == [4.5, 7.0], f"Redo失敗: markers={player_win.markers}"
+    print("Redo（Ctrl+Y: 再度 4.5秒へ再適用）テスト 成功！")
+
+    # 再び Undo して 3.0秒 に戻す
+    player_win.undo()
+    assert player_win.markers == [3.0, 7.0]
+
+    # --- [NEW] 削除に対する Undo テスト ---
+    player_win.seek(3100)
+    player_win.marker_list_widget.setCurrentRow(-1)
+    player_win.delete_selected_marker()  # 3.0秒を最寄り削除
+    assert player_win.markers == [7.0]
+    player_win.undo()  # 削除を元に戻す
+    assert player_win.markers == [3.0, 7.0]
+    print("削除に対する Undo（Ctrl+Z によるマーカー復元）テスト 成功！")
+
+    # --- [NEW] 右クリック削除リクエストテスト ---
+    player_win.slider.markerDeleteRequested.emit(7000)
+    assert player_win.markers == [3.0]
+    player_win.undo()  # これもUndo可能
+    assert player_win.markers == [3.0, 7.0]
+    print("右クリック削除 ＆ Undoテスト 成功！")
+
+    print("\n=== [6/6] レシピ生成 ＆ CMMM本体での自動分割スライスクリップ展開テスト ===")
     recipe = player_win.build_recipe_dict(mode="lossless")
-    assert len(recipe["clips"]) == 2
+    # 3.0秒と7.0秒の分割点により、10秒の動画は3つのクリップに分割される
+    assert len(recipe["clips"]) == 3
     assert recipe["clips"][0]["source"] == sample1
-    assert recipe["clips"][0]["start"] == 1.5
-    assert recipe["clips"][0]["end"] == 4.0
-    assert recipe["clips"][1]["start"] == 6.0
-    assert recipe["clips"][1]["end"] == 8.5
-    print("CMMM互換レシピ辞書の生成成功！")
+    assert recipe["clips"][0]["start"] == 0.0
+    assert recipe["clips"][0]["end"] == 3.0
+    assert recipe["clips"][1]["start"] == 3.0
+    assert recipe["clips"][1]["end"] == 7.0
+    assert recipe["clips"][2]["start"] == 7.0
+    assert abs(recipe["clips"][2]["end"] - 10.0) < 0.1
+    print(f"分割点による3つのクリップ自動スライス成功: {[ (c['start'], c['end']) for c in recipe['clips'] ]}")
 
     # 一時ファイルに保存して CMMM 本体でロード
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as tmp:
@@ -163,18 +219,23 @@ def run_player_tests():
         cmmm_win = MainWindow()
         success = cmmm_win.load_recipe(tmp_json)
         assert success is True, "CMMM本体でのレシピ読み込みに失敗しました"
-        assert cmmm_win.storyboard.count() == 2, f"CMMMに展開されたクリップ数が不正: {cmmm_win.storyboard.count()}"
+        assert cmmm_win.storyboard.count() == 3, f"CMMMに展開されたクリップ数が不正: {cmmm_win.storyboard.count()}"
 
         clip0 = cmmm_win.storyboard.item(0)
         assert clip0.file_path == sample1
-        assert abs(clip0.start_sec - 1.5) < 0.01
-        assert abs(clip0.end_sec - 4.0) < 0.01
+        assert abs(clip0.start_sec - 0.0) < 0.01
+        assert abs(clip0.end_sec - 3.0) < 0.01
 
         clip1 = cmmm_win.storyboard.item(1)
         assert clip1.file_path == sample1
-        assert abs(clip1.start_sec - 6.0) < 0.01
-        assert abs(clip1.end_sec - 8.5) < 0.01
-        print("CMMM本体へのレシピインポート ＆ ストーリーボードクリップ展開 完全成功！")
+        assert abs(clip1.start_sec - 3.0) < 0.01
+        assert abs(clip1.end_sec - 7.0) < 0.01
+
+        clip2 = cmmm_win.storyboard.item(2)
+        assert clip2.file_path == sample1
+        assert abs(clip2.start_sec - 7.0) < 0.01
+        assert abs(clip2.end_sec - 10.0) < 0.1
+        print("CMMM本体へのレシピインポート ＆ 分割クリップ自動展開 完全成功！")
 
         from PySide6.QtCore import QThreadPool
         QThreadPool.globalInstance().waitForDone(1500)

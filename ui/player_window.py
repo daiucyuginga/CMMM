@@ -15,7 +15,8 @@ from typing import Optional, List, Tuple
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QLabel, QFileDialog, QMessageBox, QSlider,
-    QListWidget, QListWidgetItem, QStyle, QApplication, QComboBox
+    QListWidget, QListWidgetItem, QStyle, QApplication, QComboBox,
+    QMenu
 )
 from PySide6.QtCore import Qt, QUrl, Signal, QRectF, QPointF, QPoint, QSize, QTimer, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QKeySequence, QShortcut, QPolygonF, QCursor
@@ -86,8 +87,10 @@ class PlayerVideoWidget(QVideoWidget):
 
 
 class PlayerSlider(QWidget):
-    """マーク済み区間の可視化ハイライトを備えたシークバー"""
+    """マーク済み区間の可視化ハイライトを備えたシークバー（再生位置シーク完全独立）"""
     positionChanged = Signal(int)
+    markerSelected = Signal(int)           # marker_ms
+    markerDeleteRequested = Signal(int)    # marker_ms
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -96,10 +99,16 @@ class PlayerSlider(QWidget):
         self.position_ms = 0
         self.dragging = False
         self.hover_x: Optional[float] = None
+        self.hover_y: Optional[float] = None
 
-        # マーク情報
+        # 分割マーカー情報 (ミリ秒単位のリスト)
+        self.markers: List[int] = []
         self.mark_in_ms: Optional[int] = None
-        self.clips: List[Tuple[int, int]] = []  # (start_ms, end_ms)
+        self.clips: List[Tuple[int, int]] = []
+
+        # マーカー表示・選択状態
+        self.hovered_marker_ms: Optional[int] = None
+        self.selected_marker_ms: Optional[int] = None
 
         self.setMouseTracking(True)
 
@@ -112,6 +121,10 @@ class PlayerSlider(QWidget):
         if not self.dragging:
             self.position_ms = max(0, min(self.duration_ms, ms))
             self.update()
+
+    def set_markers(self, markers: List[int]):
+        self.markers = sorted(markers)
+        self.update()
 
     def set_mark_in(self, ms: Optional[int]):
         self.mark_in_ms = ms
@@ -131,6 +144,28 @@ class PlayerSlider(QWidget):
         ratio = max(0.0, min(1.0, (x - 10.0) / w))
         return int(ratio * self.duration_ms)
 
+    def _hit_test_marker(self, x: float, y: float) -> Optional[int]:
+        """指定座標 (x, y) にあるマーカー（ミリ秒）を判定。なければ None"""
+        if not self.markers:
+            return None
+        h = self.height()
+        track_y = h / 2.0 - 5.0
+        track_h = 10.0
+
+        # 上部フラグ(track_y - 10) 〜 トラック下部(track_y + track_h + 10) の縦範囲
+        if not (track_y - 10 <= y <= track_y + track_h + 10):
+            return None
+
+        best_m = None
+        best_dist = 8.0  # 許容水平距離 8px
+        for m in self.markers:
+            mx = self._pos_to_x(m)
+            dist = abs(x - mx)
+            if dist < best_dist:
+                best_dist = dist
+                best_m = m
+        return best_m
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -147,31 +182,39 @@ class PlayerSlider(QWidget):
         painter.setBrush(QColor(25, 25, 30))
         painter.drawRoundedRect(track_rect, 4, 4)
 
-        # 2. 登録済みマーク区間（シアン・ブルー帯）
-        for c_start, c_end in self.clips:
-            x1 = self._pos_to_x(c_start)
-            x2 = self._pos_to_x(c_end)
-            if x2 > x1:
-                clip_rect = QRectF(x1, track_y, x2 - x1, track_h)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(0, 120, 212, 160))
-                painter.drawRect(clip_rect)
+        # 2. 分割マーカーピンの描画（縦ライン ＆ 三角フラグ）
+        for m in self.markers:
+            mx = self._pos_to_x(m)
+            is_hovered = (self.hovered_marker_ms == m)
+            is_selected = (self.selected_marker_ms == m)
 
-        # 3. 現在マーク中のプレビュー区間（In点から現在位置、黄色）
-        if self.mark_in_ms is not None:
-            x1 = self._pos_to_x(self.mark_in_ms)
-            x2 = self._pos_to_x(self.position_ms)
-            if x1 != x2:
-                start_x = min(x1, x2)
-                span_w = abs(x2 - x1)
-                mark_rect = QRectF(start_x, track_y, span_w, track_h)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(255, 185, 0, 150))
-                painter.drawRect(mark_rect)
+            # 色とスタイルの決定
+            if is_hovered or is_selected:
+                line_color = QColor(255, 235, 80)
+                flag_color = QColor(255, 220, 40)
+                flag_border = QColor(255, 255, 255)
+                flag_w = 6.0
+                flag_h = 7.0
+            else:
+                line_color = QColor(255, 185, 0)
+                flag_color = QColor(255, 185, 0)
+                flag_border = QColor(200, 140, 0)
+                flag_w = 4.0
+                flag_h = 5.0
 
-            # In点位置の縦マーカーピン
-            painter.setPen(QPen(QColor(255, 185, 0), 2))
-            painter.drawLine(QPointF(x1, track_y - 3), QPointF(x1, track_y + track_h + 3))
+            # トラックを貫くマーカー縦ライン
+            painter.setPen(QPen(line_color, 2))
+            painter.drawLine(QPointF(mx, track_y - 4), QPointF(mx, track_y + track_h + 4))
+
+            # 上部の三角マーカーフラグ
+            flag = QPolygonF([
+                QPointF(mx - flag_w, track_y - flag_h - 1),
+                QPointF(mx + flag_w, track_y - flag_h - 1),
+                QPointF(mx, track_y - 1)
+            ])
+            painter.setPen(QPen(flag_border, 1))
+            painter.setBrush(flag_color)
+            painter.drawPolygon(flag)
 
         # 4. 再生済みプログレス（半透明白）
         cur_x = self._pos_to_x(self.position_ms)
@@ -193,30 +236,81 @@ class PlayerSlider(QWidget):
         painter.drawEllipse(QPointF(cur_x, track_y + track_h / 2.0), 7, 7)
 
     def mousePressEvent(self, event):
+        pos_x = event.position().x()
+        pos_y = event.position().y()
+
         if event.button() == Qt.MouseButton.LeftButton:
+            hit_m = self._hit_test_marker(pos_x, pos_y)
+            if hit_m is not None:
+                # マーカーピンをクリックした場合は選択＆その位置へシーク
+                self.selected_marker_ms = hit_m
+                self.position_ms = hit_m
+                self.positionChanged.emit(hit_m)
+                self.markerSelected.emit(hit_m)
+            else:
+                # 通常のシーク位置へジャンプ
+                self.position_ms = self._x_to_pos(pos_x)
+                self.positionChanged.emit(self.position_ms)
+
             self.dragging = True
-            self.position_ms = self._x_to_pos(event.position().x())
-            self.positionChanged.emit(self.position_ms)
             self.update()
+
+        elif event.button() == Qt.MouseButton.RightButton:
+            hit_m = self._hit_test_marker(pos_x, pos_y)
+            if hit_m is not None:
+                self.selected_marker_ms = hit_m
+                self.markerSelected.emit(hit_m)
+                self.update()
+
+                # コンテキストメニュー
+                menu = QMenu(self)
+                act_del = menu.addAction("🗑 このマークを削除")
+                act_jump = menu.addAction("⏮ このマークへジャンプ")
+                chosen = menu.exec(event.globalPosition().toPoint())
+
+                if chosen == act_del:
+                    self.markerDeleteRequested.emit(hit_m)
+                elif chosen == act_jump:
+                    self.position_ms = hit_m
+                    self.positionChanged.emit(hit_m)
 
     def mouseMoveEvent(self, event):
         self.hover_x = event.position().x()
+        self.hover_y = event.position().y()
+
+        # 通常の再生ヘッドドラッグ
         if self.dragging:
             self.position_ms = self._x_to_pos(self.hover_x)
             self.positionChanged.emit(self.position_ms)
+            self.update()
+            return
+
+        # ホバー判定
+        hit_m = self._hit_test_marker(self.hover_x, self.hover_y)
+        if hit_m is not None:
+            self.hovered_marker_ms = hit_m
+            sec = hit_m / 1000.0
+            self.setToolTip(f"分割マーク: {sec:.2f}秒 (クリックでジャンプ / 右クリックでメニュー)")
+        else:
+            self.hovered_marker_ms = None
+            self.setToolTip("")
+
         self.update()
 
     def leaveEvent(self, event):
         self.hover_x = None
+        self.hover_y = None
+        self.hovered_marker_ms = None
         self.update()
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.dragging = False
-            self.position_ms = self._x_to_pos(event.position().x())
-            self.positionChanged.emit(self.position_ms)
-            self.update()
+            if self.dragging:
+                self.dragging = False
+                self.position_ms = self._x_to_pos(event.position().x())
+                self.positionChanged.emit(self.position_ms)
+                self.update()
 
 
 class PlayerWindow(QMainWindow):
@@ -229,11 +323,14 @@ class PlayerWindow(QMainWindow):
         # 状態
         self.file_path: Optional[str] = None
         self.duration_sec: float = 0.0
-        self.mark_in_sec: Optional[float] = None
-        self.clips: List[Tuple[float, float]] = []  # [(start_sec, end_sec)]
+        self.markers: List[float] = []  # 分割マーカー（秒単位の昇順リスト）
         self.playback_rate = 1.0
         self.speed_preset_index = 2
         self.saved_volume = 70
+
+        # Undo / Redo 履歴スタック
+        self.undo_stack: List[List[float]] = []
+        self.redo_stack: List[List[float]] = []
 
         # スキップ設定 (初期値: 5秒, index=0)
         self.skip_seconds_value = 5
@@ -255,6 +352,8 @@ class PlayerWindow(QMainWindow):
         self._setup_player_events()
 
         self.setAcceptDrops(True)
+        if QApplication.instance():
+            QApplication.instance().installEventFilter(self)
 
         # 初期読み込み (UIレンダラーバインド後に安全に実行)
         if initial_recipe_path and os.path.exists(initial_recipe_path):
@@ -430,6 +529,8 @@ class PlayerWindow(QMainWindow):
         # シークバー
         self.slider = PlayerSlider(self)
         self.slider.positionChanged.connect(self.on_slider_seek)
+        self.slider.markerSelected.connect(self._on_slider_marker_selected)
+        self.slider.markerDeleteRequested.connect(self._on_slider_marker_delete_requested)
         bottom_layout.addWidget(self.slider)
 
         # コントロール行
@@ -507,18 +608,22 @@ class PlayerWindow(QMainWindow):
 
         ctrl_layout.addSpacing(10)
 
-        # In / Out マーキングボタン
-        self.btn_in = QPushButton("［ In (I)")
-        self.btn_in.setToolTip("現在の位置を開始点にセット (I)")
-        self.btn_in.setStyleSheet("font-weight: bold; color: #ffb900;")
-        self.btn_in.clicked.connect(self.set_mark_in)
-        ctrl_layout.addWidget(self.btn_in)
+        # 分割マーキング & マーク移動ボタン
+        self.btn_marker_prev = QPushButton("⏮")
+        self.btn_marker_prev.setToolTip("前の分割マークへ移動 (J)")
+        self.btn_marker_prev.clicked.connect(lambda: self.jump_to_marker(-1))
+        ctrl_layout.addWidget(self.btn_marker_prev)
 
-        self.btn_out = QPushButton("Out (O) ］")
-        self.btn_out.setToolTip("現在の位置を終了点にして区間登録 (O)")
-        self.btn_out.setStyleSheet("font-weight: bold; color: #60cdff;")
-        self.btn_out.clicked.connect(self.set_mark_out)
-        ctrl_layout.addWidget(self.btn_out)
+        self.btn_marker = QPushButton("📍 マーク (M)")
+        self.btn_marker.setToolTip("現在位置に分割マークを設置 / 解除 (M)")
+        self.btn_marker.setStyleSheet("font-weight: bold; color: #ffb900;")
+        self.btn_marker.clicked.connect(self.toggle_marker)
+        ctrl_layout.addWidget(self.btn_marker)
+
+        self.btn_marker_next = QPushButton("⏭")
+        self.btn_marker_next.setToolTip("次の分割マークへ移動 (L)")
+        self.btn_marker_next.clicked.connect(lambda: self.jump_to_marker(1))
+        ctrl_layout.addWidget(self.btn_marker_next)
 
         ctrl_layout.addStretch()
 
@@ -535,7 +640,7 @@ class PlayerWindow(QMainWindow):
         self.splitter.addWidget(self.player_container)
 
         # ====================================================
-        # 右側: マーク区間リストパネル
+        # 右側: 分割マーカーリストパネル
         # ====================================================
         self.right_panel = QWidget()
         self.right_panel.setMinimumWidth(260)
@@ -546,34 +651,42 @@ class PlayerWindow(QMainWindow):
 
         # パネルタイトル
         header_row = QHBoxLayout()
-        lbl_list_title = QLabel("マーク区間")
-        lbl_list_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #60cdff;")
-        self.lbl_clip_count = QLabel("0 件")
-        self.lbl_clip_count.setStyleSheet("color: #888;")
+        lbl_list_title = QLabel("分割ポイント")
+        lbl_list_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ffb900;")
+        self.lbl_marker_count = QLabel("0 カ所")
+        self.lbl_marker_count.setStyleSheet("color: #888;")
+        self.lbl_clip_count = self.lbl_marker_count  # 互換用参照
         header_row.addWidget(lbl_list_title)
         header_row.addStretch()
-        header_row.addWidget(self.lbl_clip_count)
+        header_row.addWidget(self.lbl_marker_count)
         right_layout.addLayout(header_row)
 
-        # 区間リスト
-        self.clip_list_widget = QListWidget()
-        self.clip_list_widget.itemDoubleClicked.connect(self.on_clip_item_clicked)
-        right_layout.addWidget(self.clip_list_widget)
+        # マーカーリスト
+        self.marker_list_widget = QListWidget()
+        self.marker_list_widget.itemDoubleClicked.connect(self.on_marker_item_clicked)
+        self.marker_list_widget.currentRowChanged.connect(self._on_marker_list_row_changed)
+        self.clip_list_widget = self.marker_list_widget  # 互換用参照
+        right_layout.addWidget(self.marker_list_widget)
 
         # リスト操作ボタン
         list_btn_row = QHBoxLayout()
-        btn_del_clip = QPushButton("削除")
-        btn_del_clip.setToolTip("選択した区間を削除 (Delete)")
-        btn_del_clip.clicked.connect(self.delete_selected_clip)
-        list_btn_row.addWidget(btn_del_clip)
+        self.btn_move_marker = QPushButton("🔄 移動")
+        self.btn_move_marker.setToolTip("選択中（または最寄り）の分割マークを現在の再生位置へ移動 (Shift+M)")
+        self.btn_move_marker.clicked.connect(self.move_selected_marker_to_current)
+        list_btn_row.addWidget(self.btn_move_marker)
 
-        btn_clear_clips = QPushButton("全クリア")
-        btn_clear_clips.clicked.connect(self.clear_all_clips)
-        list_btn_row.addWidget(btn_clear_clips)
+        btn_del_marker = QPushButton("🗑 削除")
+        btn_del_marker.setToolTip("選択した分割マーク（または最寄りのマーク）を削除 (Delete)")
+        btn_del_marker.clicked.connect(self.delete_selected_marker)
+        list_btn_row.addWidget(btn_del_marker)
+
+        btn_clear_markers = QPushButton("全クリア")
+        btn_clear_markers.clicked.connect(self.clear_all_markers)
+        list_btn_row.addWidget(btn_clear_markers)
         right_layout.addLayout(list_btn_row)
 
-        # 合計時間サマリー
-        self.lbl_summary = QLabel("合計時間: 00:00:00.000")
+        # クリップ数 & 合計時間サマリー
+        self.lbl_summary = QLabel("クリップ数: 1 / 合計: 00:00:00.000")
         self.lbl_summary.setStyleSheet("color: #aaa; font-size: 11px;")
         right_layout.addWidget(self.lbl_summary)
 
@@ -583,7 +696,7 @@ class PlayerWindow(QMainWindow):
         self.btn_send_cmmm = QPushButton("🎬 CMMMで開く")
         self.btn_send_cmmm.setObjectName("accentButton")
         self.btn_send_cmmm.setStyleSheet("padding: 8px 12px; font-size: 13px;")
-        self.btn_send_cmmm.setToolTip("マークした区間をCMMMのストーリーボードへ即座に展開")
+        self.btn_send_cmmm.setToolTip("マークした分割ポイントでクリップに分割してCMMMへ即座に展開")
         self.btn_send_cmmm.clicked.connect(self.on_send_to_cmmm_clicked)
         right_layout.addWidget(self.btn_send_cmmm)
 
@@ -604,11 +717,8 @@ class PlayerWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_F11), self, self.toggle_fullscreen)
         # Esc: 全画面解除
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.exit_fullscreen)
-        # I / O: マーキング
-        QShortcut(QKeySequence(Qt.Key.Key_I), self, self.set_mark_in)
-        QShortcut(QKeySequence(Qt.Key.Key_O), self, self.set_mark_out)
-        # M: ミュート
-        QShortcut(QKeySequence(Qt.Key.Key_M), self, self.toggle_mute)
+        # Ctrl+M: ミュート
+        QShortcut(QKeySequence("Ctrl+M"), self, self.toggle_mute)
         # ジャンプ / スキップ ショートカット
         # 5秒 (Left / Right)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.skip_seconds(-self.skip_seconds_value))
@@ -627,8 +737,20 @@ class PlayerWindow(QMainWindow):
         # コマ送り [ / ]
         QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self, lambda: self.step_frames(-1))
         QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self, lambda: self.step_frames(1))
-        # Delete: 選択区間削除
-        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.delete_selected_clip)
+        # 分割マーカーショートカット
+        # M: マーク設置 / 解除
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, self.toggle_marker)
+        # Shift+M: 選択中（または最寄り）マークを現在位置へ移動
+        QShortcut(QKeySequence("Shift+M"), self, self.move_selected_marker_to_current)
+        # J / L: 前 / 次のマークへ移動
+        QShortcut(QKeySequence(Qt.Key.Key_J), self, lambda: self.jump_to_marker(-1))
+        QShortcut(QKeySequence(Qt.Key.Key_L), self, lambda: self.jump_to_marker(1))
+        # Delete: 選択中（または最寄り）マーカー削除
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.delete_selected_marker)
+        # Undo / Redo (元に戻す / やり直す)
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)
         # Ctrl+O / Ctrl+S
         QShortcut(QKeySequence("Ctrl+O"), self, self.on_open_file_dialog)
         QShortcut(QKeySequence("Ctrl+S"), self, self.on_save_recipe_clicked)
@@ -662,8 +784,8 @@ class PlayerWindow(QMainWindow):
 
         self.file_path = norm_path
         self.lbl_file_name.setText(os.path.basename(norm_path))
-        self.mark_in_sec = None
-        self.btn_in.setStyleSheet("font-weight: bold; color: #ffb900;")
+        self.markers.clear()
+        self._refresh_marker_list()
 
         # ffprobe で即座に正確な再生時間を取得
         try:
@@ -845,85 +967,304 @@ class PlayerWindow(QMainWindow):
                 self.bottom_controls.hide()
 
     def eventFilter(self, watched, event):
+        # 全画面時のマウス位置監視
         if self.isFullScreen():
             if event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress, QEvent.Type.Enter, QEvent.Type.Leave):
                 self._update_fullscreen_controls_visibility()
+
         return super().eventFilter(watched, event)
 
-    # --- マーキング（In / Out） ---
-    def set_mark_in(self):
-        if not self.file_path:
+    # --- Undo / Redo 履歴管理 ---
+    def _save_undo_state(self):
+        """現在のマーカー状態を Undo スタックに保存"""
+        if self.undo_stack and self.undo_stack[-1] == self.markers:
             return
-        cur_pos_ms = max(self.player.position(), self.slider.position_ms)
-        cur_sec = cur_pos_ms / 1000.0
-        self.mark_in_sec = cur_sec
-        self.slider.set_mark_in(int(cur_sec * 1000))
-        self.btn_in.setStyleSheet("background-color: rgba(255, 185, 0, 0.3); border: 2px solid #ffb900; color: #ffb900; font-weight: bold;")
-        self.statusBar().showMessage(f"In点をセット: {self._format_time(cur_sec)}", 3000)
+        self.undo_stack.append(list(self.markers))
+        if len(self.undo_stack) > 50:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
 
-    def set_mark_out(self):
-        if not self.file_path:
+    def undo(self):
+        """直前のマーカー操作を取り消す (Ctrl+Z)"""
+        if not self.undo_stack:
+            self.statusBar().showMessage("これ以上元に戻せません (Undo履歴なし)", 2000)
             return
-        cur_pos_ms = max(self.player.position(), self.slider.position_ms)
-        cur_sec = cur_pos_ms / 1000.0
-        start = self.mark_in_sec if self.mark_in_sec is not None else 0.0
-        end = max(start + 0.1, cur_sec)
 
-        # 区間登録
-        self.clips.append((start, end))
-        self.mark_in_sec = None
-        self.slider.set_mark_in(None)
-        self.btn_in.setStyleSheet("font-weight: bold; color: #ffb900;")
+        self.redo_stack.append(list(self.markers))
+        self.markers = self.undo_stack.pop()
+        self.slider.selected_marker_ms = None
+        self._refresh_marker_list()
+        self.statusBar().showMessage(f"操作を元に戻しました (残りのUndo: {len(self.undo_stack)} 件)", 2500)
 
-        self._refresh_clip_list()
-        self.statusBar().showMessage(f"区間を登録: {self._format_time(start)} ～ {self._format_time(end)}", 3000)
+    def redo(self):
+        """取り消したマーカー操作をやり直す (Ctrl+Y / Ctrl+Shift+Z)"""
+        if not self.redo_stack:
+            self.statusBar().showMessage("これ以上やり直せません (Redo履歴なし)", 2000)
+            return
 
-    def _refresh_clip_list(self):
-        self.clip_list_widget.clear()
-        total_dur = 0.0
-        slider_clips = []
+        self.undo_stack.append(list(self.markers))
+        self.markers = self.redo_stack.pop()
+        self.slider.selected_marker_ms = None
+        self._refresh_marker_list()
+        self.statusBar().showMessage(f"操作をやり直しました (残りのRedo: {len(self.redo_stack)} 件)", 2500)
 
-        for idx, (start, end) in enumerate(self.clips, start=1):
-            dur = end - start
-            total_dur += dur
-            text = f"{idx}. {self._format_time(start)} ～ {self._format_time(end)} ({dur:.1f}秒)"
+    # --- 分割マーキング（Marker） ---
+    def toggle_marker(self):
+        """現在位置に分割マークを設置または解除（トグル）"""
+        if not self.file_path or self.duration_sec <= 0:
+            return
+
+        cur_pos_ms = self.slider.position_ms
+        cur_sec = round(cur_pos_ms / 1000.0, 3)
+
+        # 先頭付近や末尾付近（0.05秒以内）は除外
+        if cur_sec <= 0.05 or cur_sec >= self.duration_sec - 0.05:
+            return
+
+        self._save_undo_state()
+
+        # 既存マーカー（±0.15秒以内）があれば解除
+        existing = [m for m in self.markers if abs(m - cur_sec) <= 0.15]
+        if existing:
+            for em in existing:
+                self.markers.remove(em)
+            self.statusBar().showMessage(f"分割マークを解除しました: {self._format_time(cur_sec)}", 2500)
+        else:
+            self.markers.append(cur_sec)
+            self.markers.sort()
+            self.statusBar().showMessage(f"分割マークを設置: {self._format_time(cur_sec)}", 2500)
+
+        self._refresh_marker_list()
+
+    def jump_to_marker(self, direction: int):
+        """前後の分割マークへジャンプ (direction: -1 = 前, 1 = 次)"""
+        if not self.markers:
+            self.statusBar().showMessage("分割マークがありません", 2000)
+            return
+
+        cur_sec = self.slider.position_ms / 1000.0
+        target: Optional[float] = None
+
+        if direction < 0:
+            # 前のマーカー
+            prev_markers = [m for m in self.markers if m < cur_sec - 0.08]
+            if prev_markers:
+                target = prev_markers[-1]
+            else:
+                target = 0.0  # 先頭
+        else:
+            # 次のマーカー
+            next_markers = [m for m in self.markers if m > cur_sec + 0.08]
+            if next_markers:
+                target = next_markers[0]
+            else:
+                target = self.duration_sec  # 末尾
+
+        if target is not None:
+            self.seek(int(target * 1000))
+            self.statusBar().showMessage(f"マークへ移動: {self._format_time(target)}", 2000)
+
+    def _refresh_marker_list(self):
+        cur_selected_sec = None
+        current_row = self.marker_list_widget.currentRow()
+        if 0 <= current_row < len(self.markers):
+            cur_selected_sec = self.markers[current_row]
+
+        self.marker_list_widget.blockSignals(True)
+        self.marker_list_widget.clear()
+        self.markers.sort()
+
+        for idx, m_sec in enumerate(self.markers, start=1):
+            text = f"📍 {idx}. {self._format_time(m_sec)}"
             item = QListWidgetItem(text)
-            self.clip_list_widget.addItem(item)
-            slider_clips.append((int(start * 1000), int(end * 1000)))
+            self.marker_list_widget.addItem(item)
 
-        self.lbl_clip_count.setText(f"{len(self.clips)} 件")
-        self.lbl_summary.setText(f"合計時間: {self._format_time(total_dur)}")
-        self.slider.set_clips(slider_clips)
+        clip_count = len(self.markers) + 1 if self.duration_sec > 0 else 0
+        self.lbl_marker_count.setText(f"{len(self.markers)} カ所")
+        self.lbl_summary.setText(f"クリップ数: {clip_count} / 合計: {self._format_time(self.duration_sec)}")
+        self.slider.set_markers([int(m * 1000) for m in self.markers])
 
-    def on_clip_item_clicked(self, item: QListWidgetItem):
-        row = self.clip_list_widget.row(item)
-        if 0 <= row < len(self.clips):
-            start, end = self.clips[row]
-            self.player.setPosition(int(start * 1000))
+        # 選択状態の復元
+        if cur_selected_sec is not None and cur_selected_sec in self.markers:
+            new_row = self.markers.index(cur_selected_sec)
+            self.marker_list_widget.setCurrentRow(new_row)
+            self.slider.selected_marker_ms = int(cur_selected_sec * 1000)
+        elif self.slider.selected_marker_ms is not None:
+            sec = self.slider.selected_marker_ms / 1000.0
+            if sec in self.markers:
+                self.marker_list_widget.setCurrentRow(self.markers.index(sec))
+            else:
+                self.slider.selected_marker_ms = None
+        else:
+            self.slider.selected_marker_ms = None
+        self.marker_list_widget.blockSignals(False)
+        self.slider.update()
+
+    def on_marker_item_clicked(self, item: QListWidgetItem):
+        row = self.marker_list_widget.row(item)
+        if 0 <= row < len(self.markers):
+            sec = self.markers[row]
+            self.seek(int(sec * 1000))
             self.player.play()
 
+    def move_selected_marker_to_current(self):
+        """選択中、または現在位置の最寄りの分割マークを現在の再生位置へ移動"""
+        if not self.file_path or not self.markers or self.duration_sec <= 0:
+            return
+
+        cur_sec = round(self.slider.position_ms / 1000.0, 3)
+        if cur_sec <= 0.05 or cur_sec >= self.duration_sec - 0.05:
+            self.statusBar().showMessage("動画の端付近には移動できません", 2000)
+            return
+
+        row = self.marker_list_widget.currentRow()
+        if 0 <= row < len(self.markers):
+            target_idx = row
+        else:
+            # 最寄りを探す
+            closest_idx = 0
+            min_diff = abs(self.markers[0] - cur_sec)
+            for idx, m in enumerate(self.markers):
+                diff = abs(m - cur_sec)
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_idx = idx
+            target_idx = closest_idx
+
+        old_sec = self.markers[target_idx]
+        if abs(old_sec - cur_sec) < 0.01:
+            return
+
+        other_markers = [m for i, m in enumerate(self.markers) if i != target_idx]
+        if any(abs(m - cur_sec) <= 0.15 for m in other_markers):
+            self.statusBar().showMessage("移動先に別の分割マークがすでに存在します", 2000)
+            return
+
+        self._save_undo_state()
+        self.markers[target_idx] = cur_sec
+        self.slider.selected_marker_ms = int(cur_sec * 1000)
+        self._refresh_marker_list()
+        self.statusBar().showMessage(f"マークを {self._format_time(old_sec)} から {self._format_time(cur_sec)} へ移動しました", 3000)
+
+    def delete_selected_marker(self):
+        """選択中、または現在位置の最寄りの分割マークを削除"""
+        if not self.markers:
+            return
+
+        row = self.marker_list_widget.currentRow()
+        cur_sec = self.slider.position_ms / 1000.0
+
+        if 0 <= row < len(self.markers):
+            self._save_undo_state()
+            del_sec = self.markers[row]
+            del self.markers[row]
+            self.slider.selected_marker_ms = None
+            self._refresh_marker_list()
+            self.statusBar().showMessage(f"分割マークを削除しました: {self._format_time(del_sec)}", 2500)
+        else:
+            # 未選択の場合、現在位置から最も近いマーカー（±0.5秒以内）を自動判定して削除
+            candidates = [(idx, m, abs(m - cur_sec)) for idx, m in enumerate(self.markers) if abs(m - cur_sec) <= 0.5]
+            if candidates:
+                self._save_undo_state()
+                candidates.sort(key=lambda x: x[2])
+                idx_to_del, del_sec, _ = candidates[0]
+                del self.markers[idx_to_del]
+                self.slider.selected_marker_ms = None
+                self._refresh_marker_list()
+                self.statusBar().showMessage(f"最寄りの分割マークを削除しました: {self._format_time(del_sec)}", 2500)
+            else:
+                self.statusBar().showMessage("削除対象のマークが選択されていないか、近くにありません", 2000)
+
+    def clear_all_markers(self):
+        if not self.markers:
+            return
+        self._save_undo_state()
+        self.markers.clear()
+        self.slider.selected_marker_ms = None
+        self._refresh_marker_list()
+
+    def _on_marker_list_row_changed(self, row: int):
+        if 0 <= row < len(self.markers):
+            sec = self.markers[row]
+            self.slider.selected_marker_ms = int(sec * 1000)
+        else:
+            self.slider.selected_marker_ms = None
+        self.slider.update()
+
+    def _on_slider_marker_selected(self, marker_ms: int):
+        sec = marker_ms / 1000.0
+        best_idx = -1
+        best_diff = 0.08
+        for idx, m in enumerate(self.markers):
+            diff = abs(m - sec)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = idx
+        if best_idx >= 0:
+            self.marker_list_widget.setCurrentRow(best_idx)
+
+    def _on_slider_marker_delete_requested(self, marker_ms: int):
+        sec = marker_ms / 1000.0
+        best_idx = -1
+        best_diff = 0.1
+        for idx, m in enumerate(self.markers):
+            diff = abs(m - sec)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = idx
+
+        if best_idx >= 0:
+            self._save_undo_state()
+            del_sec = self.markers[best_idx]
+            del self.markers[best_idx]
+            self.slider.selected_marker_ms = None
+            self._refresh_marker_list()
+            self.statusBar().showMessage(f"分割マークを削除しました: {self._format_time(del_sec)}", 2500)
+
+    # --- 互換用エイリアス ---
+    def set_mark_in(self):
+        self.toggle_marker()
+
+    def set_mark_out(self):
+        self.toggle_marker()
+
     def delete_selected_clip(self):
-        row = self.clip_list_widget.currentRow()
-        if 0 <= row < len(self.clips):
-            del self.clips[row]
-            self._refresh_clip_list()
+        self.delete_selected_marker()
 
     def clear_all_clips(self):
-        if not self.clips:
-            return
-        self.clips.clear()
-        self.mark_in_sec = None
-        self.slider.set_mark_in(None)
-        self.btn_in.setStyleSheet("font-weight: bold; color: #ffb900;")
-        self._refresh_clip_list()
+        self.clear_all_markers()
 
-    # --- レシピ生成 & 連携 ---
+    def on_clip_item_clicked(self, item):
+        self.on_marker_item_clicked(item)
+
+    # --- クリップ生成 ＆ CMMMレシピ連携 ---
+    def get_split_clips(self) -> List[Tuple[float, float]]:
+        """分割マーカーを基にクリップ区間リスト [(start, end)] を生成"""
+        if not self.file_path or self.duration_sec <= 0:
+            return []
+        if not self.markers:
+            return [(0.0, round(self.duration_sec, 3))]
+
+        points = [0.0] + sorted(self.markers) + [round(self.duration_sec, 3)]
+        clips = []
+        for i in range(len(points) - 1):
+            st = points[i]
+            en = points[i + 1]
+            if en - st >= 0.05:
+                clips.append((st, en))
+        return clips
+
+    @property
+    def clips(self) -> List[Tuple[float, float]]:
+        return self.get_split_clips()
+
     def build_recipe_dict(self, mode: str = "lossless") -> dict:
         if not self.file_path:
             return {}
 
+        split_clips = self.get_split_clips()
         clip_data = []
-        for start, end in self.clips:
+        for start, end in split_clips:
             clip_data.append({
                 "source": self.file_path,
                 "start": round(start, 3),
@@ -937,8 +1278,8 @@ class PlayerWindow(QMainWindow):
         }
 
     def on_save_recipe_clicked(self):
-        if not self.file_path or not self.clips:
-            QMessageBox.warning(self, "警告", "保存するマーク区間がありません。")
+        if not self.file_path:
+            QMessageBox.warning(self, "警告", "動画ファイルが開かれていません。")
             return
 
         base, _ = os.path.splitext(self.file_path)
@@ -950,19 +1291,18 @@ class PlayerWindow(QMainWindow):
             return
 
         recipe = self.build_recipe_dict()
-        recipe["output_file"] = f"{base}_output.mp4"
+        recipe["output_file"] = f"{base}_cut.mp4"
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(recipe, f, indent=2, ensure_ascii=False)
 
         QMessageBox.information(self, "保存完了", f"レシピを保存しました:\n{save_path}")
 
     def on_send_to_cmmm_clicked(self):
-        """マークした区間を CMMM 本体に送信して起動・展開"""
-        if not self.file_path or not self.clips:
-            QMessageBox.warning(self, "警告", "CMMMに送るマーク区間がありません。\n先にIn/Outで区間をマークしてください。")
+        """マークした分割ポイントでクリップに分割して CMMM 本体に送信・展開"""
+        if not self.file_path:
+            QMessageBox.warning(self, "警告", "動画ファイルが開かれていません。")
             return
 
-        # 一時レシピファイルを作成
         tmp_dir = tempfile.gettempdir()
         tmp_recipe = os.path.join(tmp_dir, "cmmm_player_recipe.json")
 
@@ -983,7 +1323,8 @@ class PlayerWindow(QMainWindow):
 
         try:
             subprocess.Popen([sys.executable, cmmm_script, tmp_recipe], **kwargs)
-            self.statusBar().showMessage("CMMM にクリップを展開して起動しました！", 4000)
+            clip_count = len(recipe.get("clips", []))
+            self.statusBar().showMessage(f"CMMM に {clip_count} 個のクリップを展開して起動しました！", 4000)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"CMMM の起動に失敗しました:\n{e}")
 
@@ -998,10 +1339,13 @@ class PlayerWindow(QMainWindow):
                 first_src = clips[0].get("source")
                 if first_src and os.path.exists(first_src):
                     self.open_video(first_src)
-                self.clips.clear()
-                for c in clips:
-                    self.clips.append((float(c.get("start", 0)), float(c.get("end", 0))))
-                self._refresh_clip_list()
+                self.markers.clear()
+                # クリップの境界点をマーカーとして復元
+                for i in range(len(clips) - 1):
+                    end_pt = float(clips[i].get("end", 0))
+                    if end_pt > 0:
+                        self.markers.append(round(end_pt, 3))
+                self._refresh_marker_list()
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"レシピ読み込み失敗:\n{e}")
 
