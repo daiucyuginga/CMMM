@@ -71,6 +71,76 @@ def run_tests():
     app.processEvents()
     print("非同期サムネイル処理も正常稼働中！")
 
+    print("\n=== [6/6] Undo (元に戻す) & 倍速再生ボタン テスト ===")
+    # 削除した直後（クリップ数2）で undo を実行 -> 3本に戻るはず
+    assert window.btn_undo.isEnabled()
+    window.undo()
+    assert window.storyboard.count() == 3, f"Undo後のクリップ数が不正: {window.storyboard.count()}"
+    print("クリップ削除の Undo 成功！ 2本 → 3本に復元")
+
+    # さらに undo -> 分割前に戻る（2本）
+    window.undo()
+    assert window.storyboard.count() == 2, f"Undo後のクリップ数が不正: {window.storyboard.count()}"
+    print("分割の Undo 成功！ 3本 → 2本に復元")
+
+    # ステップ式速度調整ボタンのテスト ([-] 1.0x [+])
+    assert window.speed_preset_index == 2
+    assert window.playback_rate == 1.0
+    assert window.btn_speed_reset.text() == "1.0x"
+    assert window.btn_speed_down.isEnabled() is True
+    assert window.btn_speed_up.isEnabled() is True
+
+    # 1段階アップ: 1.0x -> 2.0x
+    window.btn_speed_up.click()
+    assert window.playback_rate == 2.0
+    assert window.btn_speed_reset.text() == "2.0x"
+
+    # 8.0x までアップ
+    window.change_speed_step(10)
+    assert window.playback_rate == 8.0
+    assert window.btn_speed_reset.text() == "8.0x"
+    assert window.btn_speed_up.isEnabled() is False  # 上限で無効化
+
+    # リセットボタンクリックで 1.0x に復帰
+    window.btn_speed_reset.click()
+    assert window.playback_rate == 1.0
+    assert window.btn_speed_reset.text() == "1.0x"
+
+    # 0.25x までダウン
+    window.change_speed_step(-10)
+    assert window.playback_rate == 0.25
+    assert window.btn_speed_reset.text() == "0.25x"
+    assert window.btn_speed_down.isEnabled() is False  # 下限で無効化
+
+    # 再度 1.0x に復帰
+    window.reset_speed()
+    assert window.playback_rate == 1.0
+    assert window.btn_speed_reset.text() == "1.0x"
+    print("ステップ式速度ボタンテスト (アップ/ダウン/8.0x上限/0.25x下限/1.0xリセット) 成功！")
+
+    print("\n=== [7/8] 音声波形 (Waveform) 生成 & シークバー反映テスト ===")
+    # 非同期波形生成の完了を待機 (最大2秒)
+    for _ in range(20):
+        if window.video_slider.waveform_pixmap is not None:
+            break
+        time.sleep(0.1)
+        app.processEvents()
+
+    assert window.video_slider.waveform_pixmap is not None, "音声波形がシークバーに反映されていません"
+    assert not window.video_slider.waveform_pixmap.isNull()
+    print(f"音声波形生成 & シークバーセット成功！ サイズ: {window.video_slider.waveform_pixmap.size().width()}x{window.video_slider.waveform_pixmap.size().height()}")
+
+    print("\n=== [8/8] 画面クリック再生/停止 テスト ===")
+    from PySide6.QtMultimedia import QMediaPlayer
+    # 画面クリックで再生開始 (トグル)
+    window.video_widget.clicked.emit()
+    assert window.btn_play.text() == "⏸ 一時停止"
+    print("画面クリックでの再生開始 成功！")
+    # もう一度クリックで一時停止
+    window.video_widget.clicked.emit()
+    assert window.btn_play.text() == "▶ 再生"
+    print("画面クリックでの一時停止 成功！")
+
     print("\n[SUCCESS] ネイティブUIの主要ロジックテストがすべて正常に通過しました！")
 
 if __name__ == "__main__":

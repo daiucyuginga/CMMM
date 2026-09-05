@@ -4,8 +4,14 @@ CMMM のコア機能（解析・互換性判定・完全無劣化カット・ス
 """
 
 import os
+import sys
 import json
 import subprocess
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from core.ffmpeg_tools import FFmpegRunner
 from core.gop_analyzer import VideoAnalyzer
 from core.smart_cutter import SmartCutter, ClipSegment

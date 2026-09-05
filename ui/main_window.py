@@ -1,13 +1,17 @@
 """
 ui/main_window.py
 CMMM メインウィンドウ
-Windows ムービーメーカーの直感的な切り貼り編集（プレビュー位置で分割 → 不要クリップをDeleteで削除）を忠実に再現
+Windows ムービーメーカーの直感的な切り貼り編集（プレビュー位置で分割 → 不要クリップをDeleteで削除）
+＋ 再生ボタン長押しでの倍速再生 (2.0x) & 右クリック速度選択
+＋ Undo 機能 (Ctrl+Z / 元に戻す)
 """
 
 import os
 import sys
+import time
 import json
 import threading
+import subprocess
 from typing import Optional, List
 
 from PySide6.QtWidgets import (
@@ -15,8 +19,8 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QMessageBox, QProgressDialog,
     QButtonGroup, QGroupBox, QToolBar
 )
-from PySide6.QtCore import Qt, QUrl, Slot, Signal
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QUrl, Slot, Signal, QTimer
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 
@@ -27,6 +31,7 @@ from .styles import MODERN_DARK_STYLE
 from .storyboard import StoryboardWidget, StoryboardItem
 from .range_slider import VideoSlider
 from .async_thumbnail import ThumbnailManager
+from .async_waveform import WaveformManager
 
 
 def generate_default_output_path(source_file_path: str) -> str:
@@ -42,6 +47,24 @@ def generate_default_output_path(source_file_path: str) -> str:
         idx += 1
 
 
+SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+
+
+class ClickableVideoWidget(QVideoWidget):
+    """クリックで再生/一時停止を切り替える動画プレビュー画面"""
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+
 class MainWindow(QMainWindow):
     exportProgressSignal = Signal(int, int, str)
     exportFinishedSignal = Signal(bool, str)
@@ -49,8 +72,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CMMM")
-        self.resize(1200, 800)
-        self.setMinimumSize(960, 600)
+        self.resize(1200, 820)
+        self.setMinimumSize(960, 620)
         self.setStyleSheet(MODERN_DARK_STYLE)
 
         self.runner = FFmpegRunner()
@@ -58,14 +81,21 @@ class MainWindow(QMainWindow):
 
         # 状態
         self.base_meta: Optional[VideoMetadata] = None
-        self.mode = "lossless"  # "lossless" または "smart"
+        self.mode = "lossless"
         self.active_clip_item: Optional[StoryboardItem] = None
+        self.playback_rate = 1.0
+        self.speed_preset_index = 2
+
+        # Undo 履歴スタック & サムネイルキャッシュ
+        self.undo_stack: List[dict] = []
+        self.thumb_cache: dict[str, QPixmap] = {}
 
         # メディアプレイヤー初期化
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
-        self.video_widget = QVideoWidget(self)
+        self.video_widget = ClickableVideoWidget(self)
+        self.video_widget.clicked.connect(self.toggle_play)
         self.player.setVideoOutput(self.video_widget)
 
         self._setup_ui()
@@ -83,6 +113,14 @@ class MainWindow(QMainWindow):
         btn_add = QPushButton("➕ 動画を追加")
         btn_add.clicked.connect(self.on_add_video_clicked)
         toolbar.addWidget(btn_add)
+
+        toolbar.addSeparator()
+
+        # Undo ボタン
+        self.btn_undo = QPushButton("↩ 元に戻す")
+        self.btn_undo.setToolTip("元に戻す (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self.undo)
+        toolbar.addWidget(self.btn_undo)
 
         toolbar.addSeparator()
 
@@ -109,9 +147,20 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        btn_recipe = QPushButton("レシピ保存")
-        btn_recipe.clicked.connect(self.on_save_recipe_clicked)
-        toolbar.addWidget(btn_recipe)
+        self.btn_load_recipe = QPushButton("レシピ読込")
+        self.btn_load_recipe.clicked.connect(self.on_load_recipe_clicked)
+        toolbar.addWidget(self.btn_load_recipe)
+
+        self.btn_save_recipe = QPushButton("レシピ保存")
+        self.btn_save_recipe.clicked.connect(self.on_save_recipe_clicked)
+        toolbar.addWidget(self.btn_save_recipe)
+
+        toolbar.addSeparator()
+
+        self.btn_player = QPushButton("プレイヤー")
+        self.btn_player.setToolTip("視聴・マーク用プレイヤーを起動")
+        self.btn_player.clicked.connect(self.on_open_player_clicked)
+        toolbar.addWidget(self.btn_player)
 
         toolbar.addSeparator()
 
@@ -155,14 +204,47 @@ class MainWindow(QMainWindow):
         self.lbl_total_time.setProperty("class", "timeCode")
 
         self.lbl_clip_name_banner = QLabel("")
-        self.lbl_clip_name_banner.setStyleSheet("color: #aaa;")
+        self.lbl_clip_name_banner.setStyleSheet("color: #aaa; margin-left: 12px;")
 
         tc_layout.addWidget(self.lbl_current_time)
         tc_layout.addWidget(tc_sep)
         tc_layout.addWidget(self.lbl_total_time)
-        tc_layout.addSpacing(16)
         tc_layout.addWidget(self.lbl_clip_name_banner)
         tc_layout.addStretch()
+
+        # 速度調整セクション (ステップボタン式: [-] 1.0x [+])
+        speed_box = QWidget()
+        speed_h = QHBoxLayout(speed_box)
+        speed_h.setContentsMargins(0, 0, 0, 0)
+        speed_h.setSpacing(4)
+
+        lbl_speed_title = QLabel("速度")
+        lbl_speed_title.setStyleSheet("color: #888; font-size: 11px;")
+        speed_h.addWidget(lbl_speed_title)
+
+        self.btn_speed_down = QPushButton("－")
+        self.btn_speed_down.setFixedSize(24, 24)
+        self.btn_speed_down.setToolTip("速度ダウン")
+        self.btn_speed_down.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0;")
+        self.btn_speed_down.clicked.connect(lambda: self.change_speed_step(-1))
+        speed_h.addWidget(self.btn_speed_down)
+
+        self.btn_speed_reset = QPushButton("1.0x")
+        self.btn_speed_reset.setFixedWidth(52)
+        self.btn_speed_reset.setFixedHeight(24)
+        self.btn_speed_reset.setToolTip("クリックで等倍 (1.0x) にリセット")
+        self.btn_speed_reset.setStyleSheet("color: #60cdff; font-weight: bold; font-size: 12px; border: 1px solid #484852; border-radius: 3px; background-color: #252528; padding: 0;")
+        self.btn_speed_reset.clicked.connect(self.reset_speed)
+        speed_h.addWidget(self.btn_speed_reset)
+
+        self.btn_speed_up = QPushButton("＋")
+        self.btn_speed_up.setFixedSize(24, 24)
+        self.btn_speed_up.setToolTip("速度アップ")
+        self.btn_speed_up.setStyleSheet("font-weight: bold; font-size: 13px; padding: 0;")
+        self.btn_speed_up.clicked.connect(lambda: self.change_speed_step(1))
+        speed_h.addWidget(self.btn_speed_up)
+
+        tc_layout.addWidget(speed_box)
         preview_layout.addLayout(tc_layout)
 
         # WMM風の再生シークバー
@@ -171,26 +253,42 @@ class MainWindow(QMainWindow):
         self.video_slider.wheelStep.connect(self.on_wheel_step)
         preview_layout.addWidget(self.video_slider)
 
-        # ========================================================
-        # コントロール行（WMM風：再生、コマ送り、スキップ、そして大きな「分割」ボタン）
-        # ========================================================
+        # コントロール行
         ctrl_layout = QHBoxLayout()
 
         btn_skip_m15 = QPushButton("◀ 15秒")
         btn_skip_m15.clicked.connect(lambda: self.skip_seconds(-15))
+
         btn_skip_m1 = QPushButton("◀ 1秒")
+        btn_skip_m1.setAutoRepeat(True)
+        btn_skip_m1.setAutoRepeatDelay(350)
+        btn_skip_m1.setAutoRepeatInterval(120)
         btn_skip_m1.clicked.connect(lambda: self.skip_seconds(-1))
+
         btn_step_m1f = QPushButton("◀ 1コマ")
+        btn_step_m1f.setAutoRepeat(True)
+        btn_step_m1f.setAutoRepeatDelay(300)
+        btn_step_m1f.setAutoRepeatInterval(60)
         btn_step_m1f.clicked.connect(lambda: self.step_frames(-1))
 
+        # 再生ボタン (シンプルなQPushButton)
         self.btn_play = QPushButton("▶ 再生")
-        self.btn_play.setStyleSheet("background-color: #0078d4; color: #fff; font-weight: bold; min-width: 70px; padding: 6px 14px;")
+        self.btn_play.setStyleSheet("background-color: #0078d4; color: #fff; font-weight: bold; min-width: 76px; padding: 6px 12px;")
+        self.btn_play.setToolTip("再生 / 一時停止 (Space)")
         self.btn_play.clicked.connect(self.toggle_play)
 
         btn_step_p1f = QPushButton("1コマ ▶")
+        btn_step_p1f.setAutoRepeat(True)
+        btn_step_p1f.setAutoRepeatDelay(300)
+        btn_step_p1f.setAutoRepeatInterval(60)
         btn_step_p1f.clicked.connect(lambda: self.step_frames(1))
+
         btn_skip_p1 = QPushButton("1秒 ▶")
+        btn_skip_p1.setAutoRepeat(True)
+        btn_skip_p1.setAutoRepeatDelay(350)
+        btn_skip_p1.setAutoRepeatInterval(120)
         btn_skip_p1.clicked.connect(lambda: self.skip_seconds(1))
+
         btn_skip_p15 = QPushButton("15秒 ▶")
         btn_skip_p15.clicked.connect(lambda: self.skip_seconds(15))
 
@@ -202,18 +300,21 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(btn_skip_p1)
         ctrl_layout.addWidget(btn_skip_p15)
 
-        ctrl_layout.addSpacing(24)
+        ctrl_layout.addSpacing(20)
 
-        # WMMの主役：「ここで分割」ボタン！
-        self.btn_split = QPushButton("✂ ここで分割 (S)")
+        # 分割ボタン
+        self.btn_split = QPushButton("✂ 分割")
         self.btn_split.setObjectName("splitButton")
-        self.btn_split.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px; background-color: rgba(96, 205, 255, 0.18); border: 2px solid #60cdff; color: #60cdff;")
+        self.btn_split.setToolTip("ここで分割 (S)")
+        self.btn_split.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 16px; background-color: rgba(96, 205, 255, 0.18); border: 2px solid #60cdff; color: #60cdff;")
         self.btn_split.clicked.connect(lambda: self.split_current_clip())
         ctrl_layout.addWidget(self.btn_split)
 
         ctrl_layout.addStretch()
 
-        btn_delete_clip = QPushButton("🗑️ 選択クリップを削除 (Del)")
+        # 削除ボタン
+        btn_delete_clip = QPushButton("🗑️ 削除")
+        btn_delete_clip.setToolTip("選択クリップを削除 (Delete)")
         btn_delete_clip.clicked.connect(lambda: self.storyboard.delete_selected())
         ctrl_layout.addWidget(btn_delete_clip)
 
@@ -255,11 +356,12 @@ class MainWindow(QMainWindow):
 
         gb_tips = QGroupBox("ショートカット")
         gb_tips_layout = QVBoxLayout(gb_tips)
-        gb_tips_layout.addWidget(QLabel("Space : 再生 / 一時停止"))
-        gb_tips_layout.addWidget(QLabel("S : ここで分割"))
-        gb_tips_layout.addWidget(QLabel("Delete : 選択クリップを削除"))
-        gb_tips_layout.addWidget(QLabel("← / → : 1コマ戻し / 送り"))
-        gb_tips_layout.addWidget(QLabel("Ctrl + ←/→ : 1秒送り / 戻し"))
+        gb_tips_layout.addWidget(QLabel("Space : 再生 / 停止"))
+        gb_tips_layout.addWidget(QLabel("Ctrl + Z : 元に戻す"))
+        gb_tips_layout.addWidget(QLabel("S : 分割"))
+        gb_tips_layout.addWidget(QLabel("Delete : 削除"))
+        gb_tips_layout.addWidget(QLabel("← / → : 1コマ移動"))
+        gb_tips_layout.addWidget(QLabel("Ctrl + ←/→ : 1秒スキップ"))
         gb_tips_layout.addWidget(QLabel("↑ / ↓ : 15秒スキップ"))
         side_layout.addWidget(gb_tips)
 
@@ -277,10 +379,7 @@ class MainWindow(QMainWindow):
         sb_header = QHBoxLayout()
         sb_title = QLabel("ストーリーボード")
         sb_title.setStyleSheet("font-weight: bold; color: #ddd;")
-        sb_hint = QLabel("（不要なクリップは選択して Delete キーで削除 / ドラッグで並び替え）")
-        sb_hint.setStyleSheet("color: #888; font-size: 11px;")
         sb_header.addWidget(sb_title)
-        sb_header.addWidget(sb_hint)
         sb_header.addStretch()
         sb_layout.addLayout(sb_header)
 
@@ -289,6 +388,7 @@ class MainWindow(QMainWindow):
         self.storyboard.itemClicked.connect(self.on_clip_selected)
         self.storyboard.clipDeleted.connect(self.on_clip_deleted)
         self.storyboard.orderChanged.connect(self.update_stats)
+        self.storyboard.beforeChange.connect(self._save_undo_state)
         sb_layout.addWidget(self.storyboard)
 
         v_splitter.addWidget(sb_container)
@@ -303,6 +403,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_S), self, self.split_current_clip)
         QShortcut(QKeySequence(Qt.Key.Key_M), self, self.split_current_clip)
         QShortcut(QKeySequence("Ctrl+M"), self, self.split_current_clip)
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.step_frames(-1))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.step_frames(1))
         QShortcut(QKeySequence("Ctrl+Left"), self, lambda: self.skip_seconds(-1))
@@ -314,16 +415,105 @@ class MainWindow(QMainWindow):
 
     def _setup_player_events(self):
         self.player.positionChanged.connect(self.on_player_position_changed)
+        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.exportProgressSignal.connect(self._update_export_progress)
         self.exportFinishedSignal.connect(self._finish_export)
+
+    def _on_playback_state_changed(self, state):
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.btn_play.setText("⏸ 一時停止")
+        else:
+            self.btn_play.setText("▶ 再生")
 
     def set_mode(self, mode: str):
         self.mode = mode
         msg = "完全無劣化モード" if mode == "lossless" else "スマートカットモード"
         self.statusBar().showMessage(msg, 3000)
 
+    # ========================================================
+    # 【Undo機能】直前の操作を取り消して1つ前の状態に戻す
+    # ========================================================
+    def _save_undo_state(self):
+        """現在のストーリーボードと選択状態をスタックに退避"""
+        snapshot = []
+        for i in range(self.storyboard.count()):
+            item = self.storyboard.item(i)
+            if isinstance(item, StoryboardItem):
+                snapshot.append({
+                    "clip_id": item.clip_id,
+                    "file_path": item.file_path,
+                    "start_sec": item.start_sec,
+                    "end_sec": item.end_sec,
+                    "total_sec": item.total_sec
+                })
+
+        cur_row = self.storyboard.currentRow()
+        self.undo_stack.append({
+            "clips": snapshot,
+            "cur_row": cur_row,
+            "base_meta": self.base_meta
+        })
+        if len(self.undo_stack) > 40:
+            self.undo_stack.pop(0)
+
+    def undo(self):
+        """Ctrl+Z: 1つ前の編集状態を復元"""
+        if not self.undo_stack:
+            self.statusBar().showMessage("これ以上元に戻せません", 2000)
+            return
+
+        state = self.undo_stack.pop()
+        clips = state.get("clips", [])
+        cur_row = state.get("cur_row", 0)
+        self.base_meta = state.get("base_meta")
+
+        # ストーリーボードをクリアして再構築
+        self.storyboard.blockSignals(True)
+        self.storyboard.clear()
+
+        for c in clips:
+            item = StoryboardItem(
+                clip_id=c["clip_id"],
+                file_path=c["file_path"],
+                start_sec=c["start_sec"],
+                end_sec=c["end_sec"],
+                total_sec=c["total_sec"]
+            )
+            cid = c["clip_id"]
+            if cid in self.thumb_cache:
+                scaled = self.thumb_cache[cid].scaled(160, 90, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                item.setIcon(QIcon(scaled))
+            else:
+                ThumbnailManager.instance().request_thumbnail(
+                    clip_id=cid,
+                    video_path=c["file_path"],
+                    time_sec=c["start_sec"] + 0.5,
+                    callback=self._on_thumbnail_ready
+                )
+            self.storyboard.addItem(item)
+
+        self.storyboard.blockSignals(False)
+
+        if self.storyboard.count() > 0:
+            new_row = max(0, min(cur_row, self.storyboard.count() - 1))
+            self.storyboard.setCurrentRow(new_row)
+            item = self.storyboard.item(new_row)
+            if item:
+                self.on_clip_selected(item)
+        else:
+            self.active_clip_item = None
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self._update_base_info()
+            self._update_clip_info()
+
+        self._update_base_info()
+        self.update_stats()
+        self.statusBar().showMessage("元に戻しました (Undo)", 2000)
+
     # --- 動画追加 ---
     def add_videos(self, file_paths: List[str]):
+        self._save_undo_state()
         for path in file_paths:
             try:
                 meta = self.analyzer.get_metadata(path)
@@ -358,6 +548,12 @@ class MainWindow(QMainWindow):
                     callback=self._on_thumbnail_ready
                 )
 
+                # 音声波形のバックグラウンド先行生成
+                WaveformManager.instance().request_waveform(
+                    file_path=path,
+                    callback=self._on_waveform_ready
+                )
+
                 if self.storyboard.count() == 1:
                     self.storyboard.setCurrentItem(item)
                     self.on_clip_selected(item)
@@ -370,12 +566,18 @@ class MainWindow(QMainWindow):
         self.update_stats()
 
     def _on_thumbnail_ready(self, clip_id: str, pixmap):
+        self.thumb_cache[clip_id] = pixmap
         for i in range(self.storyboard.count()):
             item = self.storyboard.item(i)
             if isinstance(item, StoryboardItem) and item.clip_id == clip_id:
                 scaled = pixmap.scaled(160, 90, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
                 item.setIcon(QIcon(scaled))
                 break
+
+    def _on_waveform_ready(self, file_path: str, pixmap: QPixmap):
+        if self.active_clip_item and os.path.abspath(self.active_clip_item.file_path) == os.path.abspath(file_path):
+            item = self.active_clip_item
+            self.video_slider.set_waveform(pixmap, item.start_sec, item.end_sec, item.total_sec)
 
     # --- クリップ選択 ---
     def on_clip_selected(self, item: StoryboardItem):
@@ -386,10 +588,13 @@ class MainWindow(QMainWindow):
         if os.path.abspath(current_source) != os.path.abspath(file_path):
             self.player.setSource(QUrl.fromLocalFile(file_path))
 
-        # シークバーのスケールは「そのクリップの長さ」
         dur_ms = int((item.end_sec - item.start_sec) * 1000)
         self.video_slider.set_duration(dur_ms)
+        self.video_slider.set_clip_info(file_path, item.start_sec, item.end_sec, item.total_sec)
         self.player.setPosition(int(item.start_sec * 1000))
+
+        # 音声波形の要求 & 反映 (キャッシュがあれば即座に描画)
+        WaveformManager.instance().request_waveform(file_path, self._on_waveform_ready)
 
         self._update_clip_info()
 
@@ -399,6 +604,7 @@ class MainWindow(QMainWindow):
             self.active_clip_item = None
             self.player.stop()
             self.player.setSource(QUrl())
+            self.video_slider.clear_waveform()
             self._update_base_info()
             self._update_clip_info()
         else:
@@ -409,16 +615,50 @@ class MainWindow(QMainWindow):
 
     # --- プレイヤー再生制御 ---
     def toggle_play(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState or self.btn_play.text() == "⏸ 一時停止":
             self.player.pause()
             self.btn_play.setText("▶ 再生")
         else:
+            self.player.setPlaybackRate(self.playback_rate)
             self.player.play()
             self.btn_play.setText("⏸ 一時停止")
+
+    def change_speed_step(self, delta: int):
+        """速度を段階的に変更 (-1: ダウン, +1: アップ)"""
+        new_idx = max(0, min(len(SPEED_PRESETS) - 1, self.speed_preset_index + delta))
+        self.set_speed_index(new_idx)
+
+    def reset_speed(self):
+        """速度を 1.0x にリセット"""
+        idx_1x = SPEED_PRESETS.index(1.0) if 1.0 in SPEED_PRESETS else 2
+        self.set_speed_index(idx_1x)
+
+    def set_speed_index(self, index: int):
+        """指定インデックスの速度を適用"""
+        self.speed_preset_index = max(0, min(len(SPEED_PRESETS) - 1, index))
+        rate = SPEED_PRESETS[self.speed_preset_index]
+        self.playback_rate = rate
+        self.player.setPlaybackRate(rate)
+        self.btn_speed_reset.setText(f"{rate}x")
+        self.btn_speed_down.setEnabled(self.speed_preset_index > 0)
+        self.btn_speed_up.setEnabled(self.speed_preset_index < len(SPEED_PRESETS) - 1)
+
+    def set_playback_speed(self, rate: float):
+        """再生速度の直接指定"""
+        if rate in SPEED_PRESETS:
+            self.set_speed_index(SPEED_PRESETS.index(rate))
+        else:
+            self.playback_rate = rate
+            self.player.setPlaybackRate(rate)
+            self.btn_speed_reset.setText(f"{rate}x")
 
     def skip_seconds(self, sec: float):
         if not self.active_clip_item:
             return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.btn_play.setText("▶ 再生")
+
         cur_abs_ms = self.player.position()
         target_abs_ms = cur_abs_ms + int(sec * 1000)
         min_abs_ms = int(self.active_clip_item.start_sec * 1000)
@@ -427,7 +667,9 @@ class MainWindow(QMainWindow):
         self.player.setPosition(new_abs_ms)
 
     def step_frames(self, frames: int):
-        self.skip_seconds(frames * 0.033)
+        fps = self.base_meta.fps if self.base_meta and self.base_meta.fps else 30.0
+        frame_dur_sec = 1.0 / fps
+        self.skip_seconds(frames * frame_dur_sec)
 
     def on_wheel_step(self, step: int):
         self.step_frames(step)
@@ -447,11 +689,9 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ 再生")
             abs_pos_ms = start_ms
 
-        # クリップ内相対時間 (0 〜 クリップの長さ)
         rel_pos_ms = max(0, abs_pos_ms - start_ms)
         self.video_slider.set_position(rel_pos_ms)
 
-        # 表示更新 (クリップ内現在位置 / クリップの長さ)
         cur_sec = rel_pos_ms / 1000.0
         self.lbl_current_time.setText(self._format_time(cur_sec))
 
@@ -462,9 +702,7 @@ class MainWindow(QMainWindow):
         abs_pos_ms = start_ms + rel_pos_ms
         self.player.setPosition(abs_pos_ms)
 
-    # ========================================================
-    # 【WMM風 切り貼り編集の核心】現在位置でクリップをパカッと分割！
-    # ========================================================
+    # --- 分割 (Split) ---
     def split_current_clip(self, at_sec: Optional[float] = None):
         """プレビューしている位置でクリップを左右2つに分割する"""
         if not self.active_clip_item:
@@ -472,16 +710,18 @@ class MainWindow(QMainWindow):
 
         item = self.active_clip_item
         if isinstance(at_sec, bool) or at_sec is None:
-            # ユーザーがシークバーで指定した位置を基準に計算
             rel_sec = self.video_slider.position_ms / 1000.0
             cur_abs_sec = item.start_sec + rel_sec
         else:
             cur_abs_sec = float(at_sec)
 
-        # 端すぎないかチェック (先頭/末尾から0.1秒以上内側)
+        # 端すぎないかチェック
         if cur_abs_sec <= item.start_sec + 0.05 or cur_abs_sec >= item.end_sec - 0.05:
             self.statusBar().showMessage("分割位置がクリップの端に近すぎます", 2000)
             return
+
+        # Undo 状態を保存！
+        self._save_undo_state()
 
         orig_end = item.end_sec
 
@@ -489,7 +729,7 @@ class MainWindow(QMainWindow):
         item.end_sec = cur_abs_sec
         item.update_text()
 
-        # 2. 後半クリップをストーリーボードの直後に挿入
+        # 2. 後半クリップを挿入
         cur_row = self.storyboard.row(item)
         new_id = f"clip_{os.urandom(4).hex()}"
         new_item = StoryboardItem(
@@ -501,7 +741,6 @@ class MainWindow(QMainWindow):
         )
         self.storyboard.insertItem(cur_row + 1, new_item)
 
-        # 後半のサムネイル生成
         ThumbnailManager.instance().request_thumbnail(
             clip_id=new_id,
             video_path=item.file_path,
@@ -509,7 +748,6 @@ class MainWindow(QMainWindow):
             callback=self._on_thumbnail_ready
         )
 
-        # 後半を選択状態にしてプレビュー
         self.storyboard.setCurrentItem(new_item)
         self.on_clip_selected(new_item)
         self.update_stats()
@@ -598,6 +836,125 @@ class MainWindow(QMainWindow):
             "clips": clips
         }
 
+    def on_load_recipe_clicked(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "レシピ読込", "", "JSON (*.json)"
+        )
+        if file_path:
+            self.load_recipe(file_path)
+
+    def load_recipe(self, recipe_path: str) -> bool:
+        """レシピ JSON ファイルを読み込み、ストーリーボードに展開する"""
+        norm_path = os.path.abspath(recipe_path)
+        if not os.path.exists(norm_path):
+            QMessageBox.warning(self, "エラー", f"ファイルが見つかりません:\n{norm_path}")
+            return False
+
+        try:
+            with open(norm_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"レシピの読み込みに失敗しました:\n{e}")
+            return False
+
+        clips = data.get("clips", [])
+        if not clips:
+            QMessageBox.warning(self, "警告", "レシピ内にクリップが含まれていません。")
+            return False
+
+        # モードの反映
+        mode = data.get("mode", "lossless")
+        if mode in ("lossless", "smart"):
+            self.set_mode(mode)
+
+        # 既存クリップをリセット
+        self.storyboard.clear()
+        self.base_meta = None
+        self.active_clip_item = None
+        self.player.stop()
+
+        # 各クリップの追加
+        for clip in clips:
+            source = clip.get("source")
+            if not source or not os.path.exists(source):
+                continue
+            start = float(clip.get("start", 0.0))
+            end = float(clip.get("end", 0.0))
+
+            # 基準動画メタデータの読み込み
+            if self.base_meta is None:
+                try:
+                    self.base_meta = self.analyzer.get_metadata(source)
+                    self._update_base_info()
+                except Exception as e:
+                    continue
+
+            total_sec = self.base_meta.duration if (self.base_meta and source == self.base_meta.file_path) else 0.0
+            if total_sec <= 0:
+                try:
+                    meta = self.analyzer.get_metadata(source)
+                    total_sec = meta.duration
+                except Exception:
+                    total_sec = end
+
+            if end <= start:
+                end = total_sec
+
+            clip_id = f"clip_{self.storyboard.count()}_{int(time.time() * 1000)}"
+            item = StoryboardItem(
+                clip_id=clip_id,
+                file_path=source,
+                start_sec=start,
+                end_sec=end,
+                total_sec=total_sec
+            )
+            self.storyboard.addItem(item)
+            ThumbnailManager.instance().request_thumbnail(
+                item.clip_id,
+                item.file_path,
+                time_sec=item.start_sec + 0.5,
+                callback=self._on_thumbnail_ready
+            )
+
+        if self.storyboard.count() > 0:
+            first_item = self.storyboard.item(0)
+            self.storyboard.setCurrentItem(first_item)
+            self.on_clip_selected(first_item)
+            self.update_stats()
+            return True
+        else:
+            QMessageBox.warning(self, "警告", "有効な動画ファイルが見つかりませんでした。")
+            return False
+
+    def on_open_player_clicked(self):
+        """視聴・マーク用プレイヤーを起動"""
+        current_file = ""
+        if self.active_clip_item and os.path.exists(self.active_clip_item.file_path):
+            current_file = self.active_clip_item.file_path
+        elif self.storyboard.count() > 0:
+            item = self.storyboard.item(0)
+            if isinstance(item, StoryboardItem) and os.path.exists(item.file_path):
+                current_file = item.file_path
+        elif self.base_meta and os.path.exists(self.base_meta.file_path):
+            current_file = self.base_meta.file_path
+
+        player_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cmmm_player.pyw")
+        if not os.path.exists(player_script):
+            player_script = os.path.abspath("cmmm_player.pyw")
+
+        cmd = [sys.executable, player_script]
+        if current_file:
+            cmd.append(current_file)
+
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"プレイヤーの起動に失敗しました:\n{e}")
+
     def on_save_recipe_clicked(self):
         if self.storyboard.count() == 0:
             QMessageBox.warning(self, "警告", "保存するクリップがありません。")
@@ -622,6 +979,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "保存完了", f"レシピを保存しました:\n{save_path}")
 
     def on_export_clicked(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.btn_play.setText("▶ 再生")
         if self.storyboard.count() == 0:
             QMessageBox.warning(self, "警告", "エクスポートするクリップがありません。")
             return

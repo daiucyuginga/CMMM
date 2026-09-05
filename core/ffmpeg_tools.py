@@ -77,7 +77,11 @@ class FFmpegRunner:
             "-print_format", "json",
             *args
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
         stdout_str = res.stdout.decode("utf-8", errors="replace")
         stderr_str = res.stderr.decode("utf-8", errors="replace")
         if res.returncode != 0:
@@ -98,10 +102,15 @@ class FFmpegRunner:
         cmd = [self.ffmpeg_path, "-hide_banner", "-y", *args]
         logger.info(f"Running ffmpeg: {' '.join(cmd)}")
 
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            **kwargs
         )
 
         stdout_bytes, stderr_bytes = process.communicate()

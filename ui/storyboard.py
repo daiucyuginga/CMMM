@@ -41,6 +41,7 @@ class StoryboardWidget(QListWidget):
     filesDropped = Signal(list)       # 外部ファイルドロップ時 [path, ...]
     clipDeleted = Signal(str)         # 削除された clip_id
     orderChanged = Signal()           # 並び替え発生時
+    beforeChange = Signal()           # 変更前 (Undo用)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -91,11 +92,11 @@ class StoryboardWidget(QListWidget):
 
             if valid_paths:
                 event.acceptProposedAction()
-                # 外部ファイルは上書きせず、確実に追加シグナルを発行
                 self.filesDropped.emit(valid_paths)
                 return
 
         # 2. 内部カードのドラッグ並び替えの場合
+        self.beforeChange.emit()
         super().dropEvent(event)
         self.orderChanged.emit()
 
@@ -112,6 +113,7 @@ class StoryboardWidget(QListWidget):
         if not cur_item or not isinstance(cur_item, StoryboardItem):
             return
 
+        self.beforeChange.emit()
         row = self.row(cur_item)
         clip_id = cur_item.clip_id
         self.takeItem(row)
