@@ -18,7 +18,11 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("cmmm_engine")
 
 
-def execute_recipe(recipe_data: Dict[str, Any], progress_callback=None) -> bool:
+def execute_recipe(
+    recipe_data: Dict[str, Any],
+    progress_callback=None,
+    runner: FFmpegRunner = None,
+) -> bool:
     """レシピ辞書を解析して動画処理を実行する"""
     mode = recipe_data.get("mode", "smart")
     output_file = recipe_data.get("output_file")
@@ -29,7 +33,7 @@ def execute_recipe(recipe_data: Dict[str, Any], progress_callback=None) -> bool:
     if not raw_clips:
         raise ValueError("レシピにクリップが含まれていません。")
 
-    runner = FFmpegRunner()
+    runner = runner or FFmpegRunner()
     if not runner.is_available():
         raise RuntimeError("FFmpeg または FFprobe が見つかりません。")
 

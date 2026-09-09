@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import json
 import logging
+import threading
 from typing import Optional, Tuple, Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,37 @@ class FFmpegRunner:
         auto_ffmpeg, auto_ffprobe = find_ffmpeg_binaries()
         self.ffmpeg_path = ffmpeg_path or auto_ffmpeg
         self.ffprobe_path = ffprobe_path or auto_ffprobe
+        self._active_process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()
+        self.last_command: List[str] = []
+        self.last_stdout: str = ""
+        self.last_stderr: str = ""
+
+    def _set_active_process(self, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            self._active_process = process
+
+    def _clear_active_process(self, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            if self._active_process is process:
+                self._active_process = None
+
+    def cancel(self) -> None:
+        """実行中の FFmpeg/FFprobe 子プロセスを停止する。"""
+        with self._process_lock:
+            process = self._active_process
+
+        if process is None or process.poll() is not None:
+            return
+
+        try:
+            process.terminate()
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        except OSError:
+            pass
 
     def is_available(self) -> bool:
         return bool(self.ffmpeg_path and self.ffprobe_path and 
@@ -81,11 +113,22 @@ class FFmpegRunner:
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
-        stdout_str = res.stdout.decode("utf-8", errors="replace")
-        stderr_str = res.stderr.decode("utf-8", errors="replace")
-        if res.returncode != 0:
-            raise RuntimeError(f"ffprobe エラー (code {res.returncode}): {stderr_str}")
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs
+        )
+        self._set_active_process(process)
+        try:
+            stdout_bytes, stderr_bytes = process.communicate()
+        finally:
+            self._clear_active_process(process)
+
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+        if process.returncode != 0:
+            raise RuntimeError(f"ffprobe エラー (code {process.returncode}): {stderr_str}")
         try:
             return json.loads(stdout_str)
         except json.JSONDecodeError as e:
@@ -100,6 +143,9 @@ class FFmpegRunner:
             raise FileNotFoundError("ffmpeg が見つかりません。FFmpeg をインストールしてください。")
 
         cmd = [self.ffmpeg_path, "-nostdin", "-hide_banner", "-y", *args]
+        self.last_command = cmd
+        self.last_stdout = ""
+        self.last_stderr = ""
         logger.info(f"Running ffmpeg: {' '.join(cmd)}")
 
         kwargs = {}
@@ -113,10 +159,15 @@ class FFmpegRunner:
             stderr=subprocess.PIPE,
             **kwargs
         )
-
-        stdout_bytes, stderr_bytes = process.communicate()
+        self._set_active_process(process)
+        try:
+            stdout_bytes, stderr_bytes = process.communicate()
+        finally:
+            self._clear_active_process(process)
         stdout_str = stdout_bytes.decode("utf-8", errors="replace")
         stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+        self.last_stdout = stdout_str
+        self.last_stderr = stderr_str
 
         if process.returncode != 0:
             logger.error(f"FFmpeg failed with code {process.returncode}: {stderr_str}")

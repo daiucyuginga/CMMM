@@ -108,8 +108,8 @@ class SmartCutter:
         """完全無劣化モード：ストリームコピーによるキーフレーム単位カット"""
         duration = clip.end_time - clip.start_time
         args = [
-            "-ss", f"{clip.start_time:.3f}",
             "-i", clip.source_path,
+            "-ss", f"{clip.start_time:.3f}",
             "-t", f"{duration:.3f}",
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
@@ -190,8 +190,8 @@ class SmartCutter:
             mid_out = os.path.join(temp_dir, f"sub_{clip_idx:04d}_{sub_idx}.mp4")
             mid_dur = kf_before_end - mid_start
             args = [
-                "-ss", f"{mid_start:.3f}",
                 "-i", clip.source_path,
+                "-ss", f"{mid_start:.3f}",
                 "-t", f"{mid_dur:.3f}",
                 "-c", "copy",
                 "-avoid_negative_ts", "make_zero",

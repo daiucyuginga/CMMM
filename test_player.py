@@ -64,12 +64,14 @@ def run_player_tests():
     assert player_win.lbl_file_name.text() == os.path.basename(sample1)
     print("再生画面へのドラッグ＆ドロップによる動画読み込み 成功！")
 
-    print("\n=== [2/6] 全画面（フルスクリーン）トグル ＆ マウスホバー表示判定テスト ===")
+    print("\n=== [2/6] 全画面（フルスクリーン）トグル ＆ マウスホバー ＆ カーソル自動非表示テスト ===")
     player_win.enter_fullscreen()
     assert player_win.isFullScreen() is True
     assert player_win.right_panel.isVisible() is False
     assert player_win.hover_check_timer.isActive() is True
-    print("全画面化（右パネル非表示 ＆ ホバー監視タイマー起動）成功！")
+    assert player_win._cursor_hide_timer.isActive() is True
+    assert player_win._cursor_hidden is False
+    print("全画面化（右パネル非表示 ＆ ホバー監視タイマー起動 ＆ カーソル非表示タイマー起動）成功！")
 
     # 上部エリアにマウスがある場合の非表示判定
     player_win.bottom_controls.hide()
@@ -81,13 +83,27 @@ def run_player_tests():
     assert player_win.bottom_controls.isVisible() is True
     print("コントロール領域（下部ホバー）での即時表示 成功！")
 
+    # マウス静止（タイムアウト）時のカーソル ＆ コントロール自動非表示テスト
+    player_win._hide_cursor_fullscreen()
+    assert player_win._cursor_hidden is True
+    assert player_win.bottom_controls.isVisible() is False
+    print("マウス静止時のカーソル ＆ コントロール自動非表示 成功！")
+
+    # マウス移動時のカーソル再表示 ＆ タイマーリセットテスト
+    player_win._on_fullscreen_mouse_activity()
+    assert player_win._cursor_hidden is False
+    assert player_win._cursor_hide_timer.isActive() is True
+    print("マウス移動時のカーソル即時再表示 ＆ タイマーリセット 成功！")
+
     player_win.exit_fullscreen()
     assert player_win.isFullScreen() is False
     assert player_win.right_panel.isVisible() is True
     assert player_win.bottom_controls.isVisible() is True
     assert player_win.hover_check_timer.isActive() is False
+    assert player_win._cursor_hide_timer.isActive() is False
+    assert player_win._cursor_hidden is False
     assert player_win.btn_fullscreen.text() == "⛶"
-    print("全画面解除（レイアウト復帰 ＆ 常時表示化）成功！")
+    print("全画面解除（レイアウト復帰 ＆ カーソル完全復元）成功！")
 
     print("\n=== [2.5/6] スキップ時間セレクター ＆ ジャンプショートカットテスト ===")
     # 初期状態は「5秒」

@@ -21,12 +21,15 @@ def launch():
 
     # コマンドライン引数からレシピまたは動画の自動ロード (ウィンドウ表示後に実行)
     if len(sys.argv) > 1:
-        target_path = sys.argv[1]
-        if os.path.exists(target_path):
-            if target_path.lower().endswith(".json"):
-                QTimer.singleShot(100, lambda: window.load_recipe(target_path))
-            else:
-                QTimer.singleShot(100, lambda: window.add_videos([target_path]))
+        for arg in sys.argv[1:]:
+            clean = arg.strip('\'"')
+            if clean and os.path.exists(clean):
+                if clean.lower().endswith(".json"):
+                    QTimer.singleShot(100, lambda p=clean: window.load_recipe(p))
+                    break
+                else:
+                    QTimer.singleShot(100, lambda p=clean: window.add_videos([p]))
+                    break
 
     sys.exit(app.exec())
 

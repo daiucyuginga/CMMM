@@ -23,20 +23,24 @@ def launch():
 
     initial_video = ""
     initial_recipe = ""
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
-        if target.lower().endswith(".json"):
-            initial_recipe = target
-        else:
-            initial_video = target
+    for arg in sys.argv[1:]:
+        if not arg or arg.startswith("-"):
+            continue
+        clean_arg = arg.strip('\'"')
+        if not clean_arg:
+            continue
+        arg_path = os.path.abspath(clean_arg)
+        if os.path.exists(arg_path):
+            lower = arg_path.lower()
+            if lower.endswith((".mp4", ".mov", ".mkv", ".avi", ".webm", ".ts", ".m4v", ".wmv", ".flv", ".m2ts", ".mts", ".mpg", ".mpeg")):
+                if not initial_video:
+                    initial_video = arg_path
+            elif lower.endswith((".cmmm.json", ".json")):
+                if not initial_recipe:
+                    initial_recipe = arg_path
 
-    window = PlayerWindow()
+    window = PlayerWindow(initial_video_path=initial_video, initial_recipe_path=initial_recipe)
     window.show()
-
-    if initial_recipe:
-        QTimer.singleShot(100, lambda: window.load_recipe(initial_recipe))
-    elif initial_video:
-        QTimer.singleShot(100, lambda: window.open_video(initial_video))
 
     sys.exit(app.exec())
 

@@ -17,7 +17,7 @@ from typing import Optional, List
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QLabel, QFileDialog, QMessageBox, QProgressDialog,
-    QButtonGroup, QGroupBox, QToolBar
+    QButtonGroup, QGroupBox, QToolBar, QSlider
 )
 from PySide6.QtCore import Qt, QUrl, Slot, Signal, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QPixmap
@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
         self.active_clip_item: Optional[StoryboardItem] = None
         self.playback_rate = 1.0
         self.speed_preset_index = 2
+        self.saved_volume = 70
 
         # Undo 履歴スタック & サムネイルキャッシュ
         self.undo_stack: List[dict] = []
@@ -94,6 +95,7 @@ class MainWindow(QMainWindow):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(0.7)
         self.video_widget = ClickableVideoWidget(self)
         self.video_widget.clicked.connect(self.toggle_play)
         self.player.setVideoOutput(self.video_widget)
@@ -168,6 +170,11 @@ class MainWindow(QMainWindow):
         btn_export.setObjectName("accentButton")
         btn_export.clicked.connect(self.on_export_clicked)
         toolbar.addWidget(btn_export)
+
+        self.btn_ffmpeg_log = QPushButton("FFmpegログ")
+        self.btn_ffmpeg_log.setToolTip("最後に実行した FFmpeg コマンドとエラー出力を表示")
+        self.btn_ffmpeg_log.clicked.connect(self.show_ffmpeg_log)
+        toolbar.addWidget(self.btn_ffmpeg_log)
 
         # 2. メインレイアウト
         central_widget = QWidget(self)
@@ -302,6 +309,28 @@ class MainWindow(QMainWindow):
 
         ctrl_layout.addSpacing(20)
 
+        # 音量セクション
+        self.btn_mute = QPushButton("🔊")
+        self.btn_mute.setFixedSize(30, 30)
+        self.btn_mute.setToolTip("ミュート切替 (Ctrl+M)")
+        self.btn_mute.setStyleSheet("padding: 0; font-size: 14px;")
+        self.btn_mute.clicked.connect(self.toggle_mute)
+        ctrl_layout.addWidget(self.btn_mute)
+
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.setToolTip("音量スライダー (上下キーまたはホイール)")
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        ctrl_layout.addWidget(self.volume_slider)
+
+        self.lbl_volume = QLabel("70%")
+        self.lbl_volume.setStyleSheet("color: #888; min-width: 32px; font-size: 11px;")
+        ctrl_layout.addWidget(self.lbl_volume)
+
+        ctrl_layout.addSpacing(10)
+
         # 分割ボタン
         self.btn_split = QPushButton("✂ 分割")
         self.btn_split.setObjectName("splitButton")
@@ -402,14 +431,14 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle_play)
         QShortcut(QKeySequence(Qt.Key.Key_S), self, self.split_current_clip)
         QShortcut(QKeySequence(Qt.Key.Key_M), self, self.split_current_clip)
-        QShortcut(QKeySequence("Ctrl+M"), self, self.split_current_clip)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.toggle_mute)
         QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.step_frames(-1))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.step_frames(1))
         QShortcut(QKeySequence("Ctrl+Left"), self, lambda: self.skip_seconds(-1))
         QShortcut(QKeySequence("Ctrl+Right"), self, lambda: self.skip_seconds(1))
-        QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self.skip_seconds(15))
-        QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self.skip_seconds(-15))
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self.change_volume(5))
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self.change_volume(-5))
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.storyboard.delete_selected)
         QShortcut(QKeySequence(Qt.Key.Key_Backspace), self, self.storyboard.delete_selected)
 
@@ -651,6 +680,36 @@ class MainWindow(QMainWindow):
             self.playback_rate = rate
             self.player.setPlaybackRate(rate)
             self.btn_speed_reset.setText(f"{rate}x")
+
+    # --- 音量制御 ---
+    def on_volume_changed(self, val: int):
+        self.audio_output.setVolume(val / 100.0)
+        self.lbl_volume.setText(f"{val}%")
+        self.btn_mute.setText("🔇" if val == 0 else "🔊")
+
+    def toggle_mute(self):
+        is_muted = self.audio_output.isMuted()
+        if is_muted or self.volume_slider.value() == 0:
+            self.audio_output.setMuted(False)
+            self.volume_slider.setValue(self.saved_volume if self.saved_volume > 0 else 70)
+            self.btn_mute.setText("🔊")
+            self.statusBar().showMessage(f"🔊 ミュート解除 (音量: {self.volume_slider.value()}%)", 1500)
+        else:
+            self.saved_volume = self.volume_slider.value()
+            self.audio_output.setMuted(True)
+            self.volume_slider.setValue(0)
+            self.btn_mute.setText("🔇")
+            self.statusBar().showMessage("🔇 ミュート中", 1500)
+
+    def change_volume(self, delta: int):
+        cur = self.volume_slider.value()
+        new_vol = max(0, min(100, cur + delta))
+        if self.audio_output.isMuted() and new_vol > 0:
+            self.audio_output.setMuted(False)
+            self.btn_mute.setText("🔊")
+        self.volume_slider.setValue(new_vol)
+        icon = "🔇" if new_vol == 0 else "🔉" if new_vol < 50 else "🔊"
+        self.statusBar().showMessage(f"{icon} 音量: {new_vol}%", 1500)
 
     def skip_seconds(self, sec: float):
         if not self.active_clip_item:
@@ -978,6 +1037,16 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "保存完了", f"レシピを保存しました:\n{save_path}")
 
+    def show_ffmpeg_log(self):
+        if not self.runner.last_command:
+            self.statusBar().showMessage("FFmpeg 実行ログはまだありません", 2500)
+            return
+
+        cmd = " ".join(self.runner.last_command)
+        tail = self.runner.last_stderr.strip()
+        msg = f"最後のコマンド:\n{cmd}\n\nstderr:\n{tail[:4000] if tail else 'なし'}"
+        QMessageBox.information(self, "FFmpegログ", msg)
+
     def on_export_clicked(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
@@ -1009,12 +1078,18 @@ class MainWindow(QMainWindow):
                 self.exportProgressSignal.emit(cur, total, msg)
 
             try:
-                execute_recipe(recipe, progress_callback=progress_cb)
+                execute_recipe(recipe, progress_callback=progress_cb, runner=self.runner)
                 self.exportFinishedSignal.emit(True, f"書き出しが完了しました:\n{save_path}")
             except Exception as e:
                 self.exportFinishedSignal.emit(False, str(e))
 
         threading.Thread(target=run_task, daemon=True).start()
+
+    def closeEvent(self, event):
+        """終了時に実行中の FFmpeg を停止してからアプリを閉じる。"""
+        self.player.stop()
+        self.runner.cancel()
+        super().closeEvent(event)
 
     def _update_export_progress(self, cur, total, msg):
         percent = int((cur / total) * 100) if total > 0 else 0

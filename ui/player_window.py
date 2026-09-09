@@ -48,14 +48,15 @@ class KeyframeLoaderThread(QThread):
         super().__init__(parent)
         self.video_path = video_path
         self._is_cancelled = False
+        self.runner = FFmpegRunner()
 
     def cancel(self):
         self._is_cancelled = True
+        self.runner.cancel()
 
     def run(self):
         try:
-            runner = FFmpegRunner()
-            analyzer = VideoAnalyzer(runner)
+            analyzer = VideoAnalyzer(self.runner)
             kfs = analyzer.get_keyframes(self.video_path)
             if not self._is_cancelled:
                 self.keyframesLoaded.emit(kfs)
@@ -393,6 +394,13 @@ class PlayerWindow(QMainWindow):
         self.hover_check_timer = QTimer(self)
         self.hover_check_timer.setInterval(50)
         self.hover_check_timer.timeout.connect(self._update_fullscreen_controls_visibility)
+
+        # 全画面時のマウスカーソル自動非表示タイマー (2秒間静止でカーソル & コントロールを非表示)
+        self._cursor_hidden = False
+        self._cursor_hide_timer = QTimer(self)
+        self._cursor_hide_timer.setSingleShot(True)
+        self._cursor_hide_timer.setInterval(2000)
+        self._cursor_hide_timer.timeout.connect(self._hide_cursor_fullscreen)
 
         # メディアプレイヤー初期化
         self.player = QMediaPlayer(self)
@@ -894,11 +902,7 @@ class PlayerWindow(QMainWindow):
         # キーフレーム解析を非同期で開始
         self.keyframes = []
         if self._kf_thread:
-            try:
-                self._kf_thread.keyframesLoaded.disconnect()
-            except Exception:
-                pass
-            self._kf_thread.cancel()
+            self._stop_keyframe_thread()
 
         self._kf_thread = KeyframeLoaderThread(norm_path, self)
         self._kf_thread.keyframesLoaded.connect(self._on_keyframes_loaded)
@@ -910,6 +914,17 @@ class PlayerWindow(QMainWindow):
         self.player.play()
         self.btn_play.setText("⏸ 一時停止")
         self.statusBar().showMessage(f"再生中: {os.path.basename(norm_path)}", 3000)
+
+    def _stop_keyframe_thread(self):
+        if not self._kf_thread:
+            return
+        try:
+            self._kf_thread.keyframesLoaded.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self._kf_thread.cancel()
+        self._kf_thread.wait(3000)
+        self._kf_thread = None
 
     def _on_keyframes_loaded(self, kfs: List[float]):
         self.keyframes = sorted(kfs)
@@ -1128,18 +1143,54 @@ class PlayerWindow(QMainWindow):
 
         # マウス位置監視タイマーを開始し、現在位置で即時判定
         self.hover_check_timer.start(50)
+        self._cursor_hidden = False
+        self._cursor_hide_timer.start(2000)
         self._update_fullscreen_controls_visibility()
 
     def exit_fullscreen(self):
         if self.isFullScreen():
+            self._cursor_hide_timer.stop()
             self.hover_check_timer.stop()
+            if self._cursor_hidden:
+                self._cursor_hidden = False
+                QApplication.restoreOverrideCursor()
             self.bottom_controls.show()
             self.showNormal()
             self.right_panel.setVisible(True)
             self.btn_fullscreen.setText("⛶")
 
+    def _hide_cursor_fullscreen(self):
+        """全画面時にマウスが一定時間静止した場合にカーソルとコントロールを非表示化"""
+        if not self.isFullScreen():
+            return
+        if not self._cursor_hidden:
+            self._cursor_hidden = True
+            QApplication.setOverrideCursor(Qt.CursorShape.BlankCursor)
+        if self.bottom_controls.isVisible():
+            self.bottom_controls.hide()
+
+    def _show_cursor_fullscreen(self):
+        """全画面時にマウスが動いた際にカーソルを再表示"""
+        if self._cursor_hidden:
+            self._cursor_hidden = False
+            QApplication.restoreOverrideCursor()
+        self._update_fullscreen_controls_visibility()
+
+    def _on_fullscreen_mouse_activity(self):
+        """全画面中のマウス移動または操作検知"""
+        if not self.isFullScreen():
+            return
+        self._show_cursor_fullscreen()
+        self._cursor_hide_timer.start(2000)
+
     def _update_fullscreen_controls_visibility(self):
         if not self.isFullScreen():
+            return
+
+        # カーソル非表示中（マウス静止中）はコントロールも非表示を維持
+        if self._cursor_hidden:
+            if self.bottom_controls.isVisible():
+                self.bottom_controls.hide()
             return
 
         # マウスカーソルの位置（ウィンドウ内ローカル座標）
@@ -1196,9 +1247,11 @@ class PlayerWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def eventFilter(self, watched, event):
-        # 全画面時のマウス位置監視
+        # 全画面時のマウス位置監視 & カーソル自動非表示タイマーリセット
         if self.isFullScreen():
-            if event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress, QEvent.Type.Enter, QEvent.Type.Leave):
+            if event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+                self._on_fullscreen_mouse_activity()
+            elif event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
                 self._update_fullscreen_controls_visibility()
 
         # フォーカスのあるウィジェットに吸い取られずに上下・左右キーを確実に捕捉
@@ -1242,6 +1295,15 @@ class PlayerWindow(QMainWindow):
                         return True
 
         return super().eventFilter(watched, event)
+
+    def closeEvent(self, event):
+        if self._cursor_hidden:
+            self._cursor_hidden = False
+            QApplication.restoreOverrideCursor()
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self._stop_keyframe_thread()
+        super().closeEvent(event)
 
     # --- Undo / Redo 履歴管理 ---
     def _save_undo_state(self):
@@ -1582,20 +1644,157 @@ class PlayerWindow(QMainWindow):
         with open(tmp_recipe, "w", encoding="utf-8") as f:
             json.dump(recipe, f, indent=2, ensure_ascii=False)
 
-        # CMMM.pyw を起動
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cmmm_script = os.path.join(root_dir, "CMMM.pyw")
+        # CMMM 本体の探索と起動
+        launched = self._launch_cmmm_with_recipe(tmp_recipe)
+        if launched:
+            clip_count = len(recipe.get("clips", []))
+            self.statusBar().showMessage(f"CMMM に {clip_count} 個のクリップを展開して起動しました！", 4000)
+        else:
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"CMMM 本体の起動ファイル（CMMM.exe または CMMM.pyw）が見つかりませんでした。\n"
+                f"レシピファイルは一時保存されています:\n{tmp_recipe}"
+            )
+
+    def _find_python_interpreter(self) -> Optional[str]:
+        """Python インタプリタ (pythonw.exe / pyw.exe / python.exe) を安全かつ確実に探索"""
+        import shutil
+
+        # 1. 非frozen時なら sys.executable がそのまま安全に使える
+        if not getattr(sys, "frozen", False):
+            if sys.executable and os.path.exists(sys.executable):
+                return sys.executable
+
+        # 2. frozen(exe)時は sys.executable は自分自身(CMMM-Player.exe)なので絶対に使わない！
+        # 2-1. システム PATH からの探索
+        for name in ["pythonw", "pyw", "python", "py"]:
+            found = shutil.which(name)
+            if found and os.path.exists(found):
+                return found
+
+        # 2-2. Windows レジストリ (Python.NoConFile / Python.File 等) からの探索
+        if os.name == "nt":
+            try:
+                import winreg
+                reg_paths = [
+                    r"Python.NoConFile\shell\open\command",
+                    r"Python.File\shell\open\command",
+                    r"Applications\pythonw.exe\shell\open\command",
+                    r"Applications\python.exe\shell\open\command",
+                ]
+                for rp in reg_paths:
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rp) as key:
+                            val, _ = winreg.QueryValueEx(key, "")
+                            if val:
+                                if val.startswith('"'):
+                                    end_idx = val.find('"', 1)
+                                    if end_idx != -1:
+                                        p = val[1:end_idx]
+                                        if os.path.exists(p):
+                                            return p
+                                else:
+                                    p = val.split()[0]
+                                    if os.path.exists(p):
+                                        return p
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 2-3. Windows の一般的なインストール場所
+        candidates = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Launcher\pyw.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Launcher\py.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python314\pythonw.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python314\python.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python313\pythonw.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python313\python.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\python.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe"),
+            r"C:\Windows\pyw.exe",
+            r"C:\Windows\py.exe",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+
+        return None
+
+    def _launch_cmmm_with_recipe(self, recipe_path: str) -> bool:
+        """CMMM 本体（CMMM.exe または CMMM.pyw）を探してレシピを展開起動"""
+        search_dirs = []
+
+        # 1. カレントディレクトリ
+        search_dirs.append(os.path.abspath("."))
+
+        # 2. 実行ファイル（sys.executable）の場所および親ディレクトリ
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        search_dirs.append(exe_dir)
+        search_dirs.append(os.path.dirname(exe_dir))
+
+        # 3. ソーススクリプトディレクトリ（非frozen時）
+        try:
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            search_dirs.append(script_dir)
+        except Exception:
+            pass
+
+        # 4. 既知のプロジェクトインストール場所
+        search_dirs.append(r"C:\Projects_Apps\my_Projects\CMMM")
+
+        clean_dirs = []
+        for d in search_dirs:
+            if d and os.path.isdir(d) and d not in clean_dirs:
+                clean_dirs.append(d)
+
+        cmmm_exe = None
+        cmmm_pyw = None
+
+        for d in clean_dirs:
+            p_exe = os.path.join(d, "CMMM.exe")
+            if os.path.exists(p_exe) and not cmmm_exe:
+                cmmm_exe = p_exe
+            p_pyw = os.path.join(d, "CMMM.pyw")
+            if os.path.exists(p_pyw) and not cmmm_pyw:
+                cmmm_pyw = p_pyw
 
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        try:
-            subprocess.Popen([sys.executable, cmmm_script, tmp_recipe], **kwargs)
-            clip_count = len(recipe.get("clips", []))
-            self.statusBar().showMessage(f"CMMM に {clip_count} 個のクリップを展開して起動しました！", 4000)
-        except Exception as e:
-            QMessageBox.critical(self, "エラー", f"CMMM の起動に失敗しました:\n{e}")
+        # 1. CMMM.exe が見つかった場合は直接起動
+        if cmmm_exe:
+            try:
+                subprocess.Popen([cmmm_exe, recipe_path], cwd=os.path.dirname(cmmm_exe), **kwargs)
+                return True
+            except Exception as e:
+                logger.error(f"CMMM.exe 起動失敗: {e}")
+
+        # 2. CMMM.pyw が見つかった場合
+        if cmmm_pyw:
+            cmmm_dir = os.path.dirname(os.path.abspath(cmmm_pyw))
+            python_bin = self._find_python_interpreter()
+
+            if python_bin and os.path.exists(python_bin):
+                try:
+                    subprocess.Popen([python_bin, cmmm_pyw, recipe_path], cwd=cmmm_dir, **kwargs)
+                    return True
+                except Exception as e:
+                    logger.error(f"Python経由の CMMM.pyw 起動失敗: {e}")
+
+            # Python バイナリが見つからない/直接起動に失敗した場合は Windows シェルで起動
+            if os.name == "nt":
+                try:
+                    subprocess.Popen(f'start "" "{cmmm_pyw}" "{recipe_path}"', shell=True, cwd=cmmm_dir)
+                    return True
+                except Exception as e:
+                    logger.error(f"シェル経由の CMMM.pyw 起動失敗: {e}")
+
+        return False
 
     def load_recipe(self, recipe_path: str):
         if not os.path.exists(recipe_path):

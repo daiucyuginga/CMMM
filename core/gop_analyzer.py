@@ -31,6 +31,7 @@ class VideoMetadata:
 class VideoAnalyzer:
     def __init__(self, runner: Optional[FFmpegRunner] = None):
         self.runner = runner or FFmpegRunner()
+        self._keyframe_cache: Dict[str, List[float]] = {}
 
     def get_metadata(self, video_path: str) -> VideoMetadata:
         """ffprobe を用いて動画の詳細情報を取得する"""
@@ -90,6 +91,10 @@ class VideoAnalyzer:
         """
         動画内のすべてのキーフレーム（Iフレーム）のタイムスタンプ（秒）を取得する。
         """
+        abs_path = os.path.abspath(video_path)
+        if abs_path in self._keyframe_cache:
+            return list(self._keyframe_cache[abs_path])
+
         # packets で key=K_ の pts_time を高速取得
         args = [
             "-select_streams", "v:0",
@@ -116,7 +121,8 @@ class VideoAnalyzer:
         if not keyframes or keyframes[0] > 0.05:
             keyframes.insert(0, 0.0)
 
-        return keyframes
+        self._keyframe_cache[abs_path] = keyframes
+        return list(keyframes)
 
     @staticmethod
     def check_compatibility(base: VideoMetadata, target: VideoMetadata) -> Tuple[bool, str]:

@@ -27,3 +27,8 @@ cmmm_temp_*
 # IDE
 .vscode/
 .idea/
+
+# PyInstaller ビルド成果物
+build/
+dist/
+*.spec
