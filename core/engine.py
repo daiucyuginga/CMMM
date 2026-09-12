@@ -38,7 +38,27 @@ def execute_recipe(
         raise RuntimeError("FFmpeg または FFprobe が見つかりません。")
 
     analyzer = VideoAnalyzer(runner)
-    cutter = SmartCutter(runner)
+
+    # プレイヤーや外部から渡されたキーフレーム情報のキャッシュ注入
+    source_metadata = recipe_data.get("source_metadata", {})
+    if isinstance(source_metadata, dict):
+        for src_path, meta_dict in source_metadata.items():
+            if isinstance(meta_dict, dict) and "keyframes" in meta_dict:
+                analyzer.set_cached_keyframes(src_path, meta_dict["keyframes"])
+                logger.info(f"キャッシュ注入: {os.path.basename(src_path)} ({len(meta_dict['keyframes'])} キーフレーム)")
+
+    # 簡易キーフレーム形式 {"keyframes": {src: [...]}} または {"keyframes": [...]} もサポート
+    direct_kfs = recipe_data.get("keyframes")
+    if isinstance(direct_kfs, dict):
+        for src_path, kfs in direct_kfs.items():
+            if isinstance(kfs, list):
+                analyzer.set_cached_keyframes(src_path, kfs)
+    elif isinstance(direct_kfs, list) and raw_clips:
+        first_src = raw_clips[0].get("source")
+        if first_src:
+            analyzer.set_cached_keyframes(first_src, direct_kfs)
+
+    cutter = SmartCutter(runner, analyzer=analyzer)
 
     # クリップのバリデーションと互換性チェック
     clip_segments = []

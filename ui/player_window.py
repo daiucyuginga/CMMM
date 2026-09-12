@@ -1602,11 +1602,18 @@ class PlayerWindow(QMainWindow):
                 "end": round(end, 3)
             })
 
-        return {
+        recipe = {
             "mode": mode,
             "output_file": "",
             "clips": clip_data
         }
+        if self.keyframes:
+            recipe["source_metadata"] = {
+                self.file_path: {
+                    "keyframes": list(self.keyframes)
+                }
+            }
+        return recipe
 
     def on_save_recipe_clicked(self):
         if not self.file_path:

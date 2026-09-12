@@ -87,6 +87,19 @@ class VideoAnalyzer:
             audio_channels=audio_ch
         )
 
+    def set_cached_keyframes(self, video_path: str, keyframes: List[float]):
+        """
+        外部から取得済みのキーフレーム一覧をキャッシュに注入する。
+        ffprobe の重複実行を完全に回避するために使用。
+        """
+        if not keyframes:
+            return
+        abs_path = os.path.abspath(video_path)
+        kfs = sorted(list(set(keyframes)))
+        if not kfs or kfs[0] > 0.05:
+            kfs.insert(0, 0.0)
+        self._keyframe_cache[abs_path] = kfs
+
     def get_keyframes(self, video_path: str) -> List[float]:
         """
         動画内のすべてのキーフレーム（Iフレーム）のタイムスタンプ（秒）を取得する。

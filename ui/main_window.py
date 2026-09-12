@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         self.playback_rate = 1.0
         self.speed_preset_index = 2
         self.saved_volume = 70
+        self.source_metadata: dict[str, dict] = {}
 
         # Undo 履歴スタック & サムネイルキャッシュ
         self.undo_stack: List[dict] = []
@@ -889,11 +890,14 @@ class MainWindow(QMainWindow):
                     "start": item.start_sec,
                     "end": item.end_sec
                 })
-        return {
+        recipe = {
             "mode": self.mode,
             "output_file": output_file,
             "clips": clips
         }
+        if self.source_metadata:
+            recipe["source_metadata"] = self.source_metadata
+        return recipe
 
     def on_load_recipe_clicked(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -925,6 +929,13 @@ class MainWindow(QMainWindow):
         mode = data.get("mode", "lossless")
         if mode in ("lossless", "smart"):
             self.set_mode(mode)
+
+        # キーフレーム等メタデータの取得・キャッシュ注入
+        self.source_metadata = data.get("source_metadata", {})
+        if isinstance(self.source_metadata, dict):
+            for src_path, meta_dict in self.source_metadata.items():
+                if isinstance(meta_dict, dict) and "keyframes" in meta_dict:
+                    self.analyzer.set_cached_keyframes(src_path, meta_dict["keyframes"])
 
         # 既存クリップをリセット
         self.storyboard.clear()

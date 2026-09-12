@@ -25,9 +25,9 @@ class ClipSegment:
 
 
 class SmartCutter:
-    def __init__(self, runner: Optional[FFmpegRunner] = None):
+    def __init__(self, runner: Optional[FFmpegRunner] = None, analyzer: Optional[VideoAnalyzer] = None):
         self.runner = runner or FFmpegRunner()
-        self.analyzer = VideoAnalyzer(self.runner)
+        self.analyzer = analyzer or VideoAnalyzer(self.runner)
 
     def process_clips(
         self,
