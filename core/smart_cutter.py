@@ -120,18 +120,10 @@ class SmartCutter:
     def _cut_smart_single(self, clip: ClipSegment, output_path: str, temp_dir: str):
         """
         単一クリップ用のスマートカット：
-        中間全編動画を作らず、直接 output_path に出力・結合する。
+        映像（境界再エンコード＋中間入力シークコピー）と音声（全区間一括抽出）を分離して mux。
+        中間全編動画を作らず、直接 output_path に出力する。
         """
-        parts = self._prepare_clip_parts(clip, mode="smart", temp_dir=temp_dir, clip_idx=0)
-        if len(parts) == 1:
-            # 1パーツ（微小GOP再エンコードのみ、または中間コピーのみ）の場合はそのまま出力先に配置
-            if os.path.abspath(parts[0]) != os.path.abspath(output_path):
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                shutil.move(parts[0], output_path)
-        else:
-            # 複数パーツ（先頭再エンコード、中間コピー、末尾再エンコード）を直接最終出力先に結合
-            self._concat_videos(parts, output_path, temp_dir)
+        self._process_single_smart_clip(clip, output_path, temp_dir, clip_idx=0)
 
     def _prepare_clip_parts(
         self,
@@ -141,7 +133,7 @@ class SmartCutter:
         clip_idx: int
     ) -> List[str]:
         """
-        クリップを構成するパーツ（一時動画）を生成し、パス一覧を返す。
+        クリップを構成する完成動画パーツを生成し、パス一覧を返す。
         """
         if mode == "lossless":
             part_out = os.path.join(temp_dir, f"clip_{clip_idx:04d}_lossless.mp4")
@@ -149,14 +141,34 @@ class SmartCutter:
             return [part_out]
 
         # mode == "smart"
+        part_out = os.path.join(temp_dir, f"clip_{clip_idx:04d}_smart.mp4")
+        self._process_single_smart_clip(clip, part_out, temp_dir, clip_idx=clip_idx)
+        return [part_out]
+
+    def _process_single_smart_clip(
+        self,
+        clip: ClipSegment,
+        output_path: str,
+        temp_dir: str,
+        clip_idx: int
+    ):
+        """
+        単一クリップのスマートカット処理：
+        1. 映像：境界極小パートは元動画プロファイルに合わせた再エンコード、中間は入力シークで完全コピー。
+        2. 音声：全区間から元動画の音声を一括無劣化コピー（再エンコード・concatなしでプチノイズ・ズレ完全ゼロ）。
+        3. 映像と音声を 1 回で mux して output_path に出力。
+        """
         keyframes = self.analyzer.get_keyframes(clip.source_path)
         meta = self.analyzer.get_metadata(clip.source_path)
 
         start = max(0.0, clip.start_time)
         end = min(meta.duration, clip.end_time)
+        duration = end - start
 
-        if end <= start:
+        if duration <= 0:
             raise ValueError(f"無効なカット範囲: start={start}, end={end}")
+
+        has_audio = bool(meta.audio_codec)
 
         # 区間内のキーフレームを探索
         kf_before_start = max([k for k in keyframes if k <= start], default=0.0)
@@ -165,63 +177,95 @@ class SmartCutter:
 
         eps = 0.04  # 約1フレーム分の許容誤差
 
-        # ケース1: キーフレーム間に収まる微小区間 (GOPまたぎなし)
-        if kf_after_start >= end or abs(kf_before_start - kf_before_end) < eps:
-            sub_out = os.path.join(temp_dir, f"sub_{clip_idx:04d}_0.mp4")
-            self._encode_subsegment(clip.source_path, start, end, sub_out, meta)
-            return [sub_out]
-
-        # ケース2: 複数GOPにまたがる
-        parts = []
+        v_parts = []
         sub_idx = 0
 
-        # 1. 先頭パート（start 〜 次のキーフレーム）
-        if abs(start - kf_before_start) > eps:
-            head_out = os.path.join(temp_dir, f"sub_{clip_idx:04d}_{sub_idx}.mp4")
-            self._encode_subsegment(clip.source_path, start, kf_after_start, head_out, meta)
-            parts.append(head_out)
-            sub_idx += 1
-            mid_start = kf_after_start
+        # ケース1: キーフレーム間に収まる微小区間 (GOPまたぎなし)
+        if kf_after_start >= end or abs(kf_before_start - kf_before_end) < eps:
+            v_sub = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_0.mp4")
+            self._encode_video_subsegment(clip.source_path, start, end, v_sub, meta)
+            v_parts.append(v_sub)
         else:
-            mid_start = start
+            # ケース2: 複数GOPにまたがる
+            # 1. 先頭パート（start 〜 次のキーフレーム）: 映像のみ再エンコード
+            if abs(start - kf_before_start) > eps:
+                head_out = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_{sub_idx}.mp4")
+                self._encode_video_subsegment(clip.source_path, start, kf_after_start, head_out, meta)
+                v_parts.append(head_out)
+                sub_idx += 1
+                mid_start = kf_after_start
+            else:
+                mid_start = start
 
-        # 2. 中間パート（mid_start 〜 kf_before_end）：無劣化ストリームコピー！
-        if kf_before_end - mid_start > eps:
-            mid_out = os.path.join(temp_dir, f"sub_{clip_idx:04d}_{sub_idx}.mp4")
-            mid_dur = kf_before_end - mid_start
-            args = [
-                "-i", clip.source_path,
-                "-ss", f"{mid_start:.3f}",
-                "-t", f"{mid_dur:.3f}",
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                mid_out
-            ]
-            self.runner.run_ffmpeg(args)
-            parts.append(mid_out)
-            sub_idx += 1
+            # 2. 中間パート（mid_start 〜 kf_before_end）：無劣化ストリームコピー（映像のみ、入力シーク！）
+            if kf_before_end - mid_start > eps:
+                mid_out = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_{sub_idx}.mp4")
+                mid_dur = kf_before_end - mid_start
+                args = [
+                    "-ss", f"{mid_start:.3f}",
+                    "-i", clip.source_path,
+                    "-t", f"{mid_dur:.3f}",
+                    "-c:v", "copy",
+                    "-an",
+                    "-avoid_negative_ts", "make_zero",
+                    mid_out
+                ]
+                self.runner.run_ffmpeg(args)
+                v_parts.append(mid_out)
+                sub_idx += 1
 
-        # 3. 末尾パート（kf_before_end 〜 end）
-        if abs(end - kf_before_end) > eps:
-            tail_out = os.path.join(temp_dir, f"sub_{clip_idx:04d}_{sub_idx}.mp4")
-            self._encode_subsegment(clip.source_path, kf_before_end, end, tail_out, meta)
-            parts.append(tail_out)
-            sub_idx += 1
+            # 3. 末尾パート（kf_before_end 〜 end）: 映像のみ再エンコード
+            if abs(end - kf_before_end) > eps:
+                tail_out = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_{sub_idx}.mp4")
+                self._encode_video_subsegment(clip.source_path, kf_before_end, end, tail_out, meta)
+                v_parts.append(tail_out)
+                sub_idx += 1
 
-        return parts
+        # 映像パーツの統合
+        if len(v_parts) == 1:
+            merged_video = v_parts[0]
+        else:
+            merged_video = os.path.join(temp_dir, f"vmerged_{clip_idx:04d}.mp4")
+            self._concat_videos(v_parts, merged_video, temp_dir)
 
-    def _cut_smart(self, clip: ClipSegment, output_path: str, temp_dir: str, clip_idx: int):
-        """互換性のための内部ヘルパー（単一クリップのスマートカット）"""
-        parts = self._prepare_clip_parts(clip, mode="smart", temp_dir=temp_dir, clip_idx=clip_idx)
-        if len(parts) == 1:
-            if os.path.abspath(parts[0]) != os.path.abspath(output_path):
+        # 音声がない場合は映像のみを出力先へ配置
+        if not has_audio:
+            if os.path.abspath(merged_video) != os.path.abspath(output_path):
                 if os.path.exists(output_path):
                     os.remove(output_path)
-                shutil.move(parts[0], output_path)
-        else:
-            self._concat_videos(parts, output_path, temp_dir)
+                shutil.move(merged_video, output_path)
+            return
 
-    def _encode_subsegment(
+        # 音声がある場合：クリップ全区間から音声を1本の連続ストリームとして抽出（無劣化コピー）
+        clip_audio = os.path.join(temp_dir, f"a_{clip_idx:04d}.mp4")
+        audio_args = [
+            "-ss", f"{start:.3f}",
+            "-i", clip.source_path,
+            "-t", f"{duration:.3f}",
+            "-vn",
+            "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
+            clip_audio
+        ]
+        self.runner.run_ffmpeg(audio_args)
+
+        # 映像ストリームと音声ストリームを 1 回で mux して出力
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        mux_args = [
+            "-i", merged_video,
+            "-i", clip_audio,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        self.runner.run_ffmpeg(mux_args)
+
+    def _encode_video_subsegment(
         self,
         source_path: str,
         start: float,
@@ -229,7 +273,7 @@ class SmartCutter:
         output_path: str,
         meta: VideoMetadata
     ):
-        """境界部分の極小セグメントを元動画と同じコーデック・設定で高速再エンコード"""
+        """境界部分の極小セグメントを元動画のプロファイル・設定に合わせて高速再エンコード（映像のみ）"""
         duration = end - start
         codec = "libx264" if "264" in meta.video_codec.lower() else "libx265" if "265" in meta.video_codec.lower() or "hevc" in meta.video_codec.lower() else meta.video_codec
 
@@ -238,17 +282,37 @@ class SmartCutter:
             "-i", source_path,
             "-t", f"{duration:.3f}",
             "-c:v", codec,
-            "-preset", "ultrafast",  # 数コマ〜数十コマの極小なので最速プリセット
+            "-preset", "veryfast",  # ultrafastはBフレームを破棄してBaselineに退行するためveryfastを使用
             "-crf", "18",            # 視覚的ロスレス
-            "-pix_fmt", meta.video_pix_fmt if meta.video_pix_fmt != "unknown" else "yuv420p"
+            "-pix_fmt", meta.video_pix_fmt if meta.video_pix_fmt != "unknown" else "yuv420p",
+            "-an",
+            "-avoid_negative_ts", "make_zero"
         ]
 
-        if meta.audio_codec:
-            args.extend(["-c:a", "aac", "-b:a", "192k"])
-        else:
-            args.append("-an")
+        # H.264の場合、元動画のプロファイルを明示してBフレームやSPS/PPSの整合性を保つ
+        if codec == "libx264":
+            prof = meta.video_profile.lower()
+            if "high" in prof:
+                args.extend(["-profile:v", "high"])
+            elif "main" in prof:
+                args.extend(["-profile:v", "main"])
+            elif "baseline" in prof:
+                args.extend(["-profile:v", "baseline"])
 
-        args.extend(["-avoid_negative_ts", "make_zero", output_path])
+            # 元動画にBフレームがない場合はBフレームを0に
+            if meta.has_b_frames == 0:
+                args.extend(["-x264-params", "bframes=0"])
+
+        # タイムスケール（タイムベース）の維持
+        if meta.time_base and "/" in meta.time_base:
+            try:
+                num, den = meta.time_base.split("/")
+                if int(num) == 1 and int(den) > 0:
+                    args.extend(["-video_track_timescale", den])
+            except Exception:
+                pass
+
+        args.append(output_path)
         self.runner.run_ffmpeg(args)
 
     def _concat_videos(self, video_paths: List[str], output_path: str, temp_dir: str):
@@ -264,7 +328,7 @@ class SmartCutter:
                 shutil.move(src, output_path)
             return
 
-        list_file = os.path.join(temp_dir, f"concat_list_{os.getpid()}.txt")
+        list_file = os.path.join(temp_dir, f"concat_list_{os.getpid()}_{id(video_paths)}.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for p in video_paths:
                 # FFmpeg concat file format requires forward slashes and escaped quotes
@@ -276,6 +340,7 @@ class SmartCutter:
             "-safe", "0",
             "-i", list_file,
             "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
             output_path
         ]
         self.runner.run_ffmpeg(args)

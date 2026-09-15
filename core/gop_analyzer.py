@@ -23,6 +23,10 @@ class VideoMetadata:
     audio_codec: Optional[str]   # 例: aac, mp3, None
     audio_sample_rate: Optional[int] # 例: 48000, 44100
     audio_channels: Optional[int]    # 例: 2
+    video_profile: str = "high"      # 例: High, Main, Baseline
+    video_level: Optional[str] = None # 例: 40, 41
+    has_b_frames: int = 0            # Bフレーム数 (0, 2等)
+    time_base: Optional[str] = None  # 例: 1/15360
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -73,6 +77,12 @@ class VideoAnalyzer:
         audio_sr = int(audio_stream.get("sample_rate")) if audio_stream and audio_stream.get("sample_rate") else None
         audio_ch = int(audio_stream.get("channels")) if audio_stream and audio_stream.get("channels") else None
 
+        # Video Profile / B-frames / Timebase
+        video_profile = str(video_stream.get("profile", "high")).lower()
+        video_level = str(video_stream.get("level", "")) if video_stream.get("level") is not None else None
+        has_b_frames = int(video_stream.get("has_b_frames", 0) or 0)
+        time_base = video_stream.get("time_base")
+
         return VideoMetadata(
             file_path=os.path.abspath(video_path),
             file_name=os.path.basename(video_path),
@@ -84,7 +94,11 @@ class VideoAnalyzer:
             fps=round(fps, 3),
             audio_codec=audio_codec,
             audio_sample_rate=audio_sr,
-            audio_channels=audio_ch
+            audio_channels=audio_ch,
+            video_profile=video_profile,
+            video_level=video_level,
+            has_b_frames=has_b_frames,
+            time_base=time_base
         )
 
     def set_cached_keyframes(self, video_path: str, keyframes: List[float]):
