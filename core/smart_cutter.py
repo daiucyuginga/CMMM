@@ -62,15 +62,13 @@ class SmartCutter:
 
         # 出力先ディレクトリ内に一時作業用フォルダを作成（ドライブ間跨ぎのGB単位転送を防止）
         # 同一ドライブ・同一ファイルシステム内で完結させ、最速のI/Oを実現
-        temp_dir_kwargs = {"prefix": ".cmmm_temp_"}
         try:
-            test_tmp = tempfile.TemporaryDirectory(prefix=".cmmm_temp_test_", dir=out_dir)
-            test_tmp.cleanup()
-            temp_dir_kwargs["dir"] = out_dir
+            temp_ctx = tempfile.TemporaryDirectory(prefix=".cmmm_temp_", dir=out_dir)
         except Exception as e:
             logger.warning(f"出力先ディレクトリに一時フォルダを作成できないため、システムTempを使用します: {e}")
+            temp_ctx = tempfile.TemporaryDirectory(prefix=".cmmm_temp_")
 
-        with tempfile.TemporaryDirectory(**temp_dir_kwargs) as temp_dir:
+        with temp_ctx as temp_dir:
             # 単一クリップ（smartモード）の場合の最速パス
             if total_clips == 1:
                 if progress_callback:
@@ -105,16 +103,18 @@ class SmartCutter:
         return True
 
     def _cut_lossless(self, clip: ClipSegment, output_path: str):
-        """完全無劣化モード：ストリームコピーによるキーフレーム単位カット"""
+        """完全無劣化モード：高速入力シーク（-ss before -i）＋ストリームコピーによるキーフレーム単位カット"""
         duration = clip.end_time - clip.start_time
-        args = [
+        args = []
+        if clip.start_time > 0.001:
+            args.extend(["-ss", f"{clip.start_time:.3f}"])
+        args.extend([
             "-i", clip.source_path,
-            "-ss", f"{clip.start_time:.3f}",
             "-t", f"{duration:.3f}",
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             output_path
-        ]
+        ])
         self.runner.run_ffmpeg(args)
 
     def _cut_smart_single(self, clip: ClipSegment, output_path: str, temp_dir: str):
@@ -134,7 +134,15 @@ class SmartCutter:
     ) -> List[str]:
         """
         クリップを構成する完成動画パーツを生成し、パス一覧を返す。
+        元動画全編（無編集）の場合は中間ファイル生成をスキップして元動画を直接結合対象にする。
         """
+        try:
+            meta = self.analyzer.get_metadata(clip.source_path)
+            if clip.start_time <= 0.05 and meta.duration > 0 and clip.end_time >= meta.duration - 0.05:
+                return [os.path.abspath(clip.source_path)]
+        except Exception:
+            pass
+
         if mode == "lossless":
             part_out = os.path.join(temp_dir, f"clip_{clip_idx:04d}_lossless.mp4")
             self._cut_lossless(clip, part_out)
@@ -154,11 +162,11 @@ class SmartCutter:
     ):
         """
         単一クリップのスマートカット処理：
-        1. 映像：境界極小パートは元動画プロファイルに合わせた再エンコード、中間は入力シークで完全コピー。
-        2. 音声：全区間から元動画の音声を一括無劣化コピー（再エンコード・concatなしでプチノイズ・ズレ完全ゼロ）。
-        3. 映像と音声を 1 回で mux して output_path に出力。
+        1. In点・Out点周辺の局所キーフレーム解析（-read_intervals）で全編走査の待ち時間をゼロ化。
+        2. 映像：境界極小パートは元動画プロファイルに合わせた再エンコード、中間は入力シークで完全コピー。
+        3. 音声：全区間から元動画の音声を一括無劣化コピー（再エンコード・concatなしでプチノイズ・ズレ完全ゼロ）。
+        4. 映像と音声を 1 回で mux して output_path に出力。
         """
-        keyframes = self.analyzer.get_keyframes(clip.source_path)
         meta = self.analyzer.get_metadata(clip.source_path)
 
         start = max(0.0, clip.start_time)
@@ -168,6 +176,7 @@ class SmartCutter:
         if duration <= 0:
             raise ValueError(f"無効なカット範囲: start={start}, end={end}")
 
+        keyframes = self.analyzer.get_keyframes_around(clip.source_path, [start, end])
         has_audio = bool(meta.audio_codec)
 
         # 区間内のキーフレームを探索
@@ -176,6 +185,13 @@ class SmartCutter:
         kf_before_end = max([k for k in keyframes if k <= end], default=start)
 
         eps = 0.04  # 約1フレーム分の許容誤差
+
+        # 最速ショートカット: 先頭・末尾ともにキーフレーム上（または動画終端）で再エンコード不要な場合は1パス無劣化カットで即完了
+        need_head_reencode = abs(start - kf_before_start) > eps
+        need_tail_reencode = abs(end - kf_before_end) > eps and abs(end - meta.duration) > eps
+        if not need_head_reencode and not need_tail_reencode:
+            self._cut_lossless(ClipSegment(clip.source_path, start, end), output_path)
+            return
 
         v_parts = []
         sub_idx = 0
@@ -188,7 +204,7 @@ class SmartCutter:
         else:
             # ケース2: 複数GOPにまたがる
             # 1. 先頭パート（start 〜 次のキーフレーム）: 映像のみ再エンコード
-            if abs(start - kf_before_start) > eps:
+            if need_head_reencode:
                 head_out = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_{sub_idx}.mp4")
                 self._encode_video_subsegment(clip.source_path, start, kf_after_start, head_out, meta)
                 v_parts.append(head_out)
@@ -215,7 +231,7 @@ class SmartCutter:
                 sub_idx += 1
 
             # 3. 末尾パート（kf_before_end 〜 end）: 映像のみ再エンコード
-            if abs(end - kf_before_end) > eps:
+            if need_tail_reencode:
                 tail_out = os.path.join(temp_dir, f"vsub_{clip_idx:04d}_{sub_idx}.mp4")
                 self._encode_video_subsegment(clip.source_path, kf_before_end, end, tail_out, meta)
                 v_parts.append(tail_out)
@@ -238,18 +254,20 @@ class SmartCutter:
 
         # 音声がある場合：クリップ全区間から音声を1本の連続ストリームとして抽出（無劣化コピー）
         clip_audio = os.path.join(temp_dir, f"a_{clip_idx:04d}.mp4")
-        audio_args = [
-            "-ss", f"{start:.3f}",
+        audio_args = []
+        if start > 0.001:
+            audio_args.extend(["-ss", f"{start:.3f}"])
+        audio_args.extend([
             "-i", clip.source_path,
             "-t", f"{duration:.3f}",
             "-vn",
             "-c:a", "copy",
             "-avoid_negative_ts", "make_zero",
             clip_audio
-        ]
+        ])
         self.runner.run_ffmpeg(audio_args)
 
-        # 映像ストリームと音声ストリームを 1 回で mux して出力
+        # 映像ストリームと音声ストリームを 1 回で mux して出力 (faststartによる2重書き換えを排除)
         if os.path.exists(output_path):
             os.remove(output_path)
         mux_args = [
@@ -260,7 +278,6 @@ class SmartCutter:
             "-c:v", "copy",
             "-c:a", "copy",
             "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
             output_path
         ]
         self.runner.run_ffmpeg(mux_args)
@@ -321,11 +338,17 @@ class SmartCutter:
             return
 
         if len(video_paths) == 1:
-            src = video_paths[0]
-            if os.path.abspath(src) != os.path.abspath(output_path):
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                shutil.move(src, output_path)
+            src = os.path.abspath(video_paths[0])
+            dst = os.path.abspath(output_path)
+            if src != dst:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                # temp_dir 内のファイルなら move、元動画ファイルなら copy2 で保護
+                abs_temp = os.path.abspath(temp_dir)
+                if os.path.commonpath([src, abs_temp]) == abs_temp:
+                    shutil.move(src, dst)
+                else:
+                    shutil.copy2(src, dst)
             return
 
         list_file = os.path.join(temp_dir, f"concat_list_{os.getpid()}_{id(video_paths)}.txt")

@@ -134,6 +134,39 @@ class FFmpegRunner:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"ffprobe の出力 JSON パースに失敗しました: {e}\n出力: {stdout_str}")
 
+    def run_ffprobe_csv(self, args: List[str]) -> str:
+        """ffprobe を CSV (ヘッダなし) 形式で高速実行し、標準出力文字列を返す"""
+        if not self.ffprobe_path:
+            raise FileNotFoundError("ffprobe が見つかりません。FFmpeg をインストールしてください。")
+
+        cmd = [
+            self.ffprobe_path,
+            "-v", "quiet",
+            "-print_format", "csv=p=0",
+            *args
+        ]
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs
+        )
+        self._set_active_process(process)
+        try:
+            stdout_bytes, stderr_bytes = process.communicate()
+        finally:
+            self._clear_active_process(process)
+
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+        if process.returncode != 0:
+            raise RuntimeError(f"ffprobe エラー (code {process.returncode}): {stderr_str}")
+        return stdout_str
+
     def run_ffmpeg(self, args: List[str], progress_callback=None) -> bool:
         """
         ffmpeg を実行する。

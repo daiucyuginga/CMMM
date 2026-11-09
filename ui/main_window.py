@@ -141,6 +141,7 @@ class MainWindow(QMainWindow):
         self.btn_smart = QPushButton("スマートカット")
         self.btn_smart.setCheckable(True)
         self.btn_smart.setProperty("class", "modeButton")
+        self.btn_smart.setToolTip("スマートカット (※境界でコマ落ち・音ズレが発生する可能性があります)")
         self.btn_smart.clicked.connect(lambda: self.set_mode("smart"))
         toolbar.addWidget(self.btn_smart)
 
@@ -457,7 +458,7 @@ class MainWindow(QMainWindow):
 
     def set_mode(self, mode: str):
         self.mode = mode
-        msg = "完全無劣化モード" if mode == "lossless" else "スマートカットモード"
+        msg = "完全無劣化モード" if mode == "lossless" else "スマートカットモード (⚠️ コマ落ちの可能性あり)"
         self.statusBar().showMessage(msg, 3000)
 
     # ========================================================
@@ -1065,6 +1066,19 @@ class MainWindow(QMainWindow):
         if self.storyboard.count() == 0:
             QMessageBox.warning(self, "警告", "エクスポートするクリップがありません。")
             return
+
+        if self.mode == "smart":
+            ret = QMessageBox.warning(
+                self,
+                "スマートカットの確認",
+                "【注意】スマートカットモードは、再エンコード部とコピー部の境界でコマ落ち・カクつき・音ズレが発生する可能性があります。\n\n"
+                "安定した出力を得るには「完全無劣化モード」を推奨します。\n\n"
+                "このままエクスポートを続行しますか？",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel
+            )
+            if ret != QMessageBox.StandardButton.Ok:
+                return
 
         first_item = self.storyboard.item(0)
         default_out = "output(1).mp4"

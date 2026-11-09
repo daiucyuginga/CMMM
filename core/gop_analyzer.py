@@ -33,14 +33,44 @@ class VideoMetadata:
 
 
 class VideoAnalyzer:
+    # プロセス内で共有するメタデータ・キーフレームキャッシュ (UIとエンジン間の重複ffprobe実行を排除)
+    _global_metadata_cache: Dict[Tuple[str, float, int], VideoMetadata] = {}
+    _global_keyframe_cache: Dict[str, List[float]] = {}
+
     def __init__(self, runner: Optional[FFmpegRunner] = None):
         self.runner = runner or FFmpegRunner()
-        self._keyframe_cache: Dict[str, List[float]] = {}
+        self._keyframe_cache: Dict[str, List[float]] = self._global_keyframe_cache
+
+    @staticmethod
+    def _parse_keyframe_csv(csv_text: str) -> List[float]:
+        """ffprobe の csv=p=0 出力 (pts_time,flags) からキーフレームの秒リストを高速抽出"""
+        keyframes = []
+        for line in csv_text.splitlines():
+            if "K" in line:
+                pts_str = line.split(",", 1)[0]
+                try:
+                    keyframes.append(float(pts_str))
+                except ValueError:
+                    pass
+        keyframes = sorted(list(set(keyframes)))
+        if not keyframes or keyframes[0] > 0.05:
+            keyframes.insert(0, 0.0)
+        return keyframes
 
     def get_metadata(self, video_path: str) -> VideoMetadata:
-        """ffprobe を用いて動画の詳細情報を取得する"""
+        """ffprobe を用いて動画の詳細情報を取得する（同一ファイルの重複実行はキャッシュで即座に返却）"""
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"動画ファイルが見つかりません: {video_path}")
+
+        abs_path = os.path.abspath(video_path)
+        try:
+            st = os.stat(abs_path)
+            cache_key = (abs_path, st.st_mtime, st.st_size)
+        except OSError:
+            cache_key = (abs_path, 0.0, 0)
+
+        if cache_key in self._global_metadata_cache:
+            return self._global_metadata_cache[cache_key]
 
         data = self.runner.run_ffprobe_json([
             "-show_format",
@@ -83,8 +113,8 @@ class VideoAnalyzer:
         has_b_frames = int(video_stream.get("has_b_frames", 0) or 0)
         time_base = video_stream.get("time_base")
 
-        return VideoMetadata(
-            file_path=os.path.abspath(video_path),
+        meta = VideoMetadata(
+            file_path=abs_path,
             file_name=os.path.basename(video_path),
             duration=duration,
             width=int(video_stream.get("width", 0)),
@@ -100,6 +130,8 @@ class VideoAnalyzer:
             has_b_frames=has_b_frames,
             time_base=time_base
         )
+        self._global_metadata_cache[cache_key] = meta
+        return meta
 
     def set_cached_keyframes(self, video_path: str, keyframes: List[float]):
         """
@@ -122,34 +154,72 @@ class VideoAnalyzer:
         if abs_path in self._keyframe_cache:
             return list(self._keyframe_cache[abs_path])
 
-        # packets で key=K_ の pts_time を高速取得
+        # CSV形式 (csv=p=0) でパケット情報を軽量・高速取得
         args = [
             "-select_streams", "v:0",
             "-show_packets",
             "-show_entries", "packet=pts_time,flags",
             video_path
         ]
-        data = self.runner.run_ffprobe_json(args)
-        packets = data.get("packets", [])
-
-        keyframes = []
-        for p in packets:
-            flags = p.get("flags", "")
-            pts_time = p.get("pts_time")
-            if "K" in flags and pts_time is not None:
-                try:
-                    keyframes.append(float(pts_time))
-                except ValueError:
-                    pass
-
-        # 重複削除＆ソート
-        keyframes = sorted(list(set(keyframes)))
-        # 0.0 がなければ先頭に追加
-        if not keyframes or keyframes[0] > 0.05:
-            keyframes.insert(0, 0.0)
+        csv_text = self.runner.run_ffprobe_csv(args)
+        keyframes = self._parse_keyframe_csv(csv_text)
 
         self._keyframe_cache[abs_path] = keyframes
         return list(keyframes)
+
+    def get_keyframes_around(
+        self,
+        video_path: str,
+        timestamps: List[float],
+        window_sec: float = 15.0
+    ) -> List[float]:
+        """
+        指定したタイムスタンプ（In点・Out点等）の周辺のみのキーフレームを
+        ffprobe -read_intervals を使ってピンポイントで超高速（約0.05秒）に取得する。
+        キャッシュに全キーフレームがある場合はそれを即座に返す。
+        """
+        abs_path = os.path.abspath(video_path)
+        if abs_path in self._keyframe_cache:
+            return list(self._keyframe_cache[abs_path])
+
+        if not timestamps:
+            return self.get_keyframes(video_path)
+
+        # 区間 [max(0, t - window_sec), t + window_sec] を作成して重なりをマージ
+        raw_intervals = []
+        for t in sorted(timestamps):
+            st = max(0.0, t - window_sec)
+            en = max(st + 1.0, t + window_sec)
+            raw_intervals.append([st, en])
+
+        merged = []
+        for iv in raw_intervals:
+            if not merged or iv[0] > merged[-1][1]:
+                merged.append(iv)
+            else:
+                merged[-1][1] = max(merged[-1][1], iv[1])
+
+        interval_specs = [f"{st:.2f}%+{en - st:.2f}" for st, en in merged]
+        read_intervals_arg = ",".join(interval_specs)
+
+        try:
+            args = [
+                "-select_streams", "v:0",
+                "-read_intervals", read_intervals_arg,
+                "-show_packets",
+                "-show_entries", "packet=pts_time,flags",
+                video_path
+            ]
+            csv_text = self.runner.run_ffprobe_csv(args)
+            kfs = self._parse_keyframe_csv(csv_text)
+
+            # 最初のタイムスタンプの後にキーフレームが1つも見つからない等の異常時のみ全体解析へフォールバック
+            min_t = min(timestamps)
+            if len(kfs) <= 1 and min_t > 1.0:
+                return self.get_keyframes(video_path)
+            return kfs
+        except Exception:
+            return self.get_keyframes(video_path)
 
     @staticmethod
     def check_compatibility(base: VideoMetadata, target: VideoMetadata) -> Tuple[bool, str]:
